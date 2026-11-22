@@ -172,6 +172,15 @@ pub fn stop_script(unit: &UnitName) -> String {
     format!("systemctl --user stop {}", shell_quote(&unit.scope()))
 }
 
+/// Create the workspace and report whether `systemd-run --user --scope` works: prints `caps=1` or `caps=0`.
+pub fn preflight_script(ws: &RemotePath) -> String {
+    format!(
+        "mkdir -p {} && if systemd-run --user --scope --quiet true >/dev/null 2>&1; \
+         then echo caps=1; else echo caps=0; fi",
+        ws.render()
+    )
+}
+
 /// Wrap a script as one `sh -c` command line for ssh.
 pub fn wrap_for_ssh(script: &str) -> String {
     format!("sh -c {}", shell_quote(script))
@@ -414,6 +423,15 @@ mod tests {
         fn drop(&mut self) {
             let _ = Command::new("kill").arg(&self.0).status();
         }
+    }
+
+    #[test]
+    fn preflight_script_golden() {
+        let ws = RemotePath::parse("~/my cache").join("ws");
+        assert_eq!(
+            preflight_script(&ws),
+            r#"mkdir -p "$HOME"/'my cache/ws' && if systemd-run --user --scope --quiet true >/dev/null 2>&1; then echo caps=1; else echo caps=0; fi"#
+        );
     }
 
     #[test]
