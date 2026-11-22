@@ -168,7 +168,10 @@ impl RunScript<'_> {
         let mut s = format!("cd {} && ", self.workspace.render());
         if let Some(f) = self.env_file {
             let f = shell_quote(f);
-            s += &format!(". ./{f} && rm -f ./{f} && ");
+            // Resolve `rm` first: the sourced env may replace PATH.
+            s += &format!(
+                "__hopbox_rm=$(command -v rm) && . ./{f} && \"$__hopbox_rm\" -f ./{f} && "
+            );
         }
         if !self.subdir.is_empty() {
             // `./` stops a leading `-` being read as an option and keeps CDPATH out of it.
@@ -223,6 +226,11 @@ pub fn env_write_script(ws: &RemotePath, name: &str) -> String {
         ws.render(),
         shell_quote(name)
     )
+}
+
+/// Remove an env file that was written but never used.
+pub fn env_remove_script(ws: &RemotePath, name: &str) -> String {
+    format!("rm -f {}/{}", ws.render(), shell_quote(name))
 }
 
 /// Create the workspace and report whether `systemd-run --user --scope` works: prints `caps=1` or `caps=0`.
@@ -460,9 +468,10 @@ mod tests {
         }
         .render();
         assert!(
-            s.contains(
-                "cd /w && . ./.hopbox-env-deadbeef && rm -f ./.hopbox-env-deadbeef && cd ./sub && exec "
-            ),
+            s.contains(concat!(
+                r#"cd /w && __hopbox_rm=$(command -v rm) && . ./.hopbox-env-deadbeef && "#,
+                r#""$__hopbox_rm" -f ./.hopbox-env-deadbeef && cd ./sub && exec "#
+            )),
             "{s}"
         );
         assert_eq!(

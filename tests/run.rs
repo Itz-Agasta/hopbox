@@ -472,3 +472,52 @@ fn sync_waits_for_the_lock() {
     let readme = s.ssh("cat ~/.cache/hopbox/ws/*/README");
     assert_eq!(String::from_utf8_lossy(&readme.stdout), "hi\n");
 }
+
+#[test]
+fn fetch_refuses_symlinked_parent() {
+    let Some(s) = common::sshd() else { return };
+    let e = setup(&s);
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), e.sub.join("out")).unwrap();
+    let o = run(&s, &e, &["run", "--fetch", "out/r.txt", "--", "true"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        !outside.path().join("r.txt").exists(),
+        "fetch wrote through a symlink"
+    );
+    assert!(String::from_utf8_lossy(&o.stderr).contains("hopbox: warning: fetch out/r.txt"));
+}
+
+#[test]
+fn env_path_without_rm_still_cleans_up() {
+    let Some(s) = common::sshd() else { return };
+    let e = setup(&s);
+    // A local PATH that exists only on the laptop: the remote finds no `rm` under it.
+    let bin = tempfile::tempdir().unwrap();
+    for tool in ["ssh", "rsync", "git", "kill", "hostname", "sh"] {
+        let found = Command::new("sh")
+            .args(["-c", &format!("command -v {tool}")])
+            .output()
+            .unwrap();
+        let path = String::from_utf8(found.stdout).unwrap();
+        if !path.trim().is_empty() {
+            std::os::unix::fs::symlink(path.trim(), bin.path().join(tool)).unwrap();
+        }
+    }
+    let o = hopbox(
+        &s,
+        &e,
+        &e.sub,
+        &["run", "--env", "PATH", "--", "echo", "ran"],
+    )
+    .env("PATH", bin.path())
+    .output()
+    .unwrap();
+    let left = s.ssh("ls -A ~/.cache/hopbox/ws/*/ | grep -c hopbox-env || true");
+    assert_eq!(
+        String::from_utf8_lossy(&left.stdout).trim(),
+        "0",
+        "env file left behind: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}

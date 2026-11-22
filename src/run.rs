@@ -16,8 +16,8 @@ use crate::config::{self, Resolved, RunFlags};
 use crate::exit;
 use crate::quote::shell_quote;
 use crate::remote_script::{
-    Caps, LOCKED_LINE, LockScript, RemotePath, RunScript, UnitName, env_write_script,
-    oom_check_script, stop_script,
+    Caps, LOCKED_LINE, LockScript, RemotePath, RunScript, UnitName, env_remove_script,
+    env_write_script, oom_check_script, stop_script,
 };
 use crate::status::{Source, Status};
 use crate::sync::{SyncError, relative_path, sync};
@@ -126,13 +126,26 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
             other => usage(other),
         })?;
     }
+    // Fallible local setup first, so nothing below can fail with secrets left on the remote.
+    let log = match args.tail {
+        Some(_) => Some(open_log(&env.log_dir, &unit)?),
+        None => None,
+    };
     let env_file = format!(".hopbox-env-{}", unit.id());
     let env_file = if env_file_body.is_empty() {
         None
     } else {
-        let out = t
-            .capture_input(&env_write_script(&ws, &env_file), env_file_body.as_bytes())
-            .map_err(usage)?;
+        let out = t.capture_input(
+            &env_write_script(&ws, &env_file),
+            env_file_body.as_bytes(),
+            &|pid| track_pid(pid, &interrupt),
+        );
+        CHILD_PID.store(0, Ordering::SeqCst);
+        if interrupt.load(Ordering::SeqCst) {
+            let _ = t.capture(&env_remove_script(&ws, &env_file));
+            return Err(interrupted());
+        }
+        let out = out.map_err(usage)?;
         if !out.status.success() {
             return Err(usage(format!(
                 "cannot write the env file on {}: {}",
@@ -155,12 +168,15 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     }
     .render();
 
-    let log = match args.tail {
-        Some(_) => Some(open_log(&env.log_dir, &unit)?),
-        None => None,
+    let mut child = match t.spawn(&script, env.stdout_tty) {
+        Ok(c) => c,
+        Err(e) => {
+            if let Some(f) = &env_file {
+                let _ = t.capture(&env_remove_script(&ws, f));
+            }
+            return Err(usage(e));
+        }
     };
-
-    let mut child = t.spawn(&script, env.stdout_tty).map_err(usage)?;
     track_child(&child, &interrupt);
     let out = forward(
         child.stdout.take().expect("piped"),
@@ -231,7 +247,10 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
             }
         }
     }
-    fetch_back(&t, &ws, &tree, &fetch);
+    fetch_back(&t, &ws, &tree, &fetch, &interrupt);
+    if interrupt.load(Ordering::SeqCst) {
+        return Err(interrupted());
+    }
     holder.release();
     Ok(result)
 }
@@ -346,9 +365,23 @@ fn env_file_contents(flag_names: &[String], repo_names: &[String]) -> Result<Str
 }
 
 /// Copy each path back from the remote copy of the current subdirectory. Failures warn only.
-fn fetch_back(t: &Transport, ws: &RemotePath, tree: &LocalTree, paths: &[String]) {
+fn fetch_back(
+    t: &Transport,
+    ws: &RemotePath,
+    tree: &LocalTree,
+    paths: &[String],
+    interrupt: &AtomicBool,
+) {
     let local_cwd = tree.root.join(&tree.subdir);
     for p in paths {
+        if interrupt.load(Ordering::SeqCst) {
+            return;
+        }
+        let rel_parent = Path::new(p).parent().unwrap_or(Path::new(""));
+        if symlink_on_path(&local_cwd, rel_parent) {
+            eprintln!("hopbox: warning: fetch {p} skipped: a parent directory is a symlink");
+            continue;
+        }
         let mut remote = ws.rsync_arg();
         for part in [tree.subdir.as_str(), p.as_str()] {
             if !part.is_empty() {
@@ -360,7 +393,7 @@ fn fetch_back(t: &Transport, ws: &RemotePath, tree: &LocalTree, paths: &[String]
         let status = std::fs::create_dir_all(&parent).and_then(|_| {
             let mut dest = parent.into_os_string();
             dest.push("/");
-            std::process::Command::new("rsync")
+            let mut child = std::process::Command::new("rsync")
                 .args(["-a", "-s", "-e"])
                 .arg(t.rsync_rsh())
                 .arg(format!("{}:{remote}", t.dest()))
@@ -368,7 +401,11 @@ fn fetch_back(t: &Transport, ws: &RemotePath, tree: &LocalTree, paths: &[String]
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .status()
+                .spawn()?;
+            track_pid(child.id(), interrupt);
+            let status = child.wait();
+            CHILD_PID.store(0, Ordering::SeqCst);
+            status
         });
         match status {
             Ok(s) if s.success() => {}
@@ -379,6 +416,21 @@ fn fetch_back(t: &Transport, ws: &RemotePath, tree: &LocalTree, paths: &[String]
             Err(e) => eprintln!("hopbox: warning: fetch {p} failed ({e})"),
         }
     }
+}
+
+/// Whether any existing directory between `base` and `base/rel` is a symlink, which could
+/// redirect a fetch outside the checkout.
+fn symlink_on_path(base: &Path, rel: &Path) -> bool {
+    let mut cur = base.to_path_buf();
+    for part in rel.components() {
+        cur.push(part);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 fn exit_code(status: ExitStatus) -> i32 {

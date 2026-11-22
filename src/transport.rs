@@ -116,7 +116,13 @@ impl Transport {
     }
 
     /// Run a script with `input` on its stdin and collect its output.
-    pub fn capture_input(&self, script: &str, input: &[u8]) -> Result<Output, TransportError> {
+    /// `on_spawn` gets the ssh pid, so a signal handler can stop it.
+    pub fn capture_input(
+        &self,
+        script: &str,
+        input: &[u8],
+        on_spawn: &dyn Fn(u32),
+    ) -> Result<Output, TransportError> {
         use std::io::Write;
         let mut child = self
             .command(script, false)
@@ -124,6 +130,7 @@ impl Transport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+        on_spawn(child.id());
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(input)?;
         }
