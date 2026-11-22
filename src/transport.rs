@@ -13,7 +13,7 @@ use crate::remote_script::{RemotePath, preflight_script, wrap_for_ssh};
 /// Internal hook: an ssh config file passed as `-F`. Used by the integration tests.
 pub const SSH_CONFIG_ENV: &str = "HOPBOX_SSH_CONFIG";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Transport {
     dest: String,
     ssh_config: Option<PathBuf>,
