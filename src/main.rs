@@ -32,17 +32,25 @@ fn main() -> ExitCode {
                     Status::hopbox_error(exit::USAGE.into(), "-", Duration::ZERO, format!("{e:#}"))
                 }
             };
-            eprintln!(
-                "{}",
-                if args.json {
-                    status.json()
-                } else {
-                    status.line()
-                }
-            );
+            print_status(if args.json {
+                status.json()
+            } else {
+                status.line()
+            });
             ExitCode::from(u8::try_from(status.exit).unwrap_or(1))
         }
     }
+}
+
+/// Print the final status without letting a stalled stderr reader keep hopbox alive: after an
+/// interrupt, a detached output forwarder may still be blocked holding the stderr lock.
+fn print_status(line: String) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        eprintln!("{line}");
+        let _ = tx.send(());
+    });
+    let _ = rx.recv_timeout(Duration::from_secs(2));
 }
 
 fn env() -> anyhow::Result<run::Env> {
