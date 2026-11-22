@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -53,7 +54,7 @@ pub struct RsyncSpec<'a> {
     /// Paths git reports as ignored (dirs end in `/`). When set, they are fed to rsync on stdin
     /// as exact excludes, which keeps git's full semantics (`!` negation, nested and global
     /// ignores). `None` outside a git repo: fall back to rsync's `.gitignore` filter.
-    pub git_ignored: Option<&'a [String]>,
+    pub git_ignored: Option<&'a [Vec<u8>]>,
 }
 
 impl RsyncSpec<'_> {
@@ -67,6 +68,9 @@ impl RsyncSpec<'_> {
             .map(OsString::from)
             .collect();
         a.push(self.rsh.into());
+        // hopbox's own remote-only files must survive --delete (a running job holds the lock).
+        a.push("--filter=P /.hopbox.lock".into());
+        a.push("--filter=P /.hopbox-last-used".into());
         // `.git` without a slash also covers a worktree's `.git` file.
         a.push("--exclude=.git".into());
         for secret in SECRET_EXCLUDES {
@@ -89,6 +93,9 @@ impl RsyncSpec<'_> {
             Some(_) => {
                 a.push("--from0".into());
                 a.push("--exclude-from=-".into());
+                // Receiver-side only: protects ignored remote-only paths (a remote target/ or
+                // node_modules/) from --delete without changing what is sent.
+                a.push("--filter=dir-merge,-r .gitignore".into());
             }
             None => a.push("--filter=:- .gitignore".into()),
         }
@@ -142,54 +149,84 @@ fn normalize_includes(includes: &[String]) -> Result<Vec<String>, SyncError> {
 /// Escape a path so rsync matches it literally. rsync honors backslash escapes only in
 /// patterns that contain a wildcard, so plain paths are left as they are.
 fn literal(path: &str) -> String {
-    if !path.contains(['*', '?', '[']) {
-        return path.to_owned();
+    String::from_utf8(literal_bytes(path.as_bytes())).expect("escaping keeps UTF-8")
+}
+
+fn literal_bytes(path: &[u8]) -> Vec<u8> {
+    let wild = |b: &u8| matches!(b, b'*' | b'?' | b'[');
+    if !path.iter().any(wild) {
+        return path.to_vec();
     }
-    let mut out = String::with_capacity(path.len() + 4);
-    for c in path.chars() {
-        if matches!(c, '*' | '?' | '[' | '\\') {
-            out.push('\\');
+    let mut out = Vec::with_capacity(path.len() + 4);
+    for &b in path {
+        if wild(&b) || b == b'\\' {
+            out.push(b'\\');
         }
-        out.push(c);
+        out.push(b);
     }
     out
 }
 
 /// NUL-separated anchored, literal exclude patterns for `--from0 --exclude-from=-`.
-pub fn exclude_list(git_ignored: &[String]) -> Vec<u8> {
+pub fn exclude_list(git_ignored: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     for p in git_ignored {
         out.push(b'/');
-        out.extend_from_slice(literal(p).as_bytes());
+        out.extend_from_slice(&literal_bytes(p));
         out.push(0);
     }
     out
 }
 
-/// Untracked paths git ignores, with ignored dirs collapsed (`dir/`). `None` outside git.
-pub fn git_ignored(root: &Path) -> Option<Vec<String>> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "ls-files",
-            "-z",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--directory",
-        ])
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    Some(
-        out.stdout
-            .split(|&b| b == 0)
+/// Untracked paths git ignores, as raw bytes with ignored dirs collapsed (`dir/`), including
+/// inside initialized submodules. `None` outside git.
+pub fn git_ignored(root: &Path) -> Option<Vec<Vec<u8>>> {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout)
+    };
+    let split = |out: Vec<u8>| -> Vec<Vec<u8>> {
+        out.split(|&b| b == 0)
             .filter(|p| !p.is_empty())
-            .map(|p| String::from_utf8_lossy(p).into_owned())
-            .collect(),
-    )
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    let mut paths = split(git(&[
+        "ls-files",
+        "-z",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+    ])?);
+    // Submodules are gitlinks (mode 160000): "<mode> <sha> <stage>\t<path>".
+    for entry in split(git(&["ls-files", "-z", "--stage"]).unwrap_or_default()) {
+        let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        if !entry.starts_with(b"160000 ") {
+            continue;
+        }
+        let sub = &entry[tab + 1..];
+        let sub_root = root.join(std::ffi::OsStr::from_bytes(sub));
+        if !sub_root.join(".git").exists() {
+            continue;
+        }
+        for p in git_ignored(&sub_root).unwrap_or_default() {
+            let mut full = sub.to_vec();
+            full.push(b'/');
+            full.extend_from_slice(&p);
+            paths.push(full);
+        }
+    }
+    Some(paths)
 }
 
 /// `a/b/c` → `["a", "a/b"]`.
@@ -391,7 +428,7 @@ mod tests {
     #[test]
     fn git_ignored_list_replaces_gitignore_filter() {
         let ws = RemotePath::parse("~/.cache/hopbox/ws/r-1");
-        let ignored = s(&["target/"]);
+        let ignored = vec![b"target/".to_vec()];
         let sp = RsyncSpec {
             git_ignored: Some(&ignored),
             ..spec(&ws, &[], &[], &[])
@@ -401,7 +438,11 @@ mod tests {
             a.contains(&"--exclude-from=-".to_string()) && a.contains(&"--from0".to_string()),
             "{a:?}"
         );
-        assert!(!a.iter().any(|x| x.contains(".gitignore")), "{a:?}");
+        assert!(!a.iter().any(|x| x == "--filter=:- .gitignore"), "{a:?}");
+        assert!(
+            a.contains(&"--filter=dir-merge,-r .gitignore".to_string()),
+            "{a:?}"
+        );
         assert_eq!(exclude_list(&ignored), b"/target/\0");
     }
 

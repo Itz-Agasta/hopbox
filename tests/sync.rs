@@ -147,3 +147,93 @@ fn include_with_glob_chars_is_literal() {
     assert!(files.contains(&"./data/[ab].txt".to_string()), "{files:?}");
     assert!(!files.contains(&"./data/a.txt".to_string()), "{files:?}");
 }
+
+fn git_ok(dir: &Path, args: &[&str]) {
+    let ok = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "protocol.file.allow=always",
+        ])
+        .args(args)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok, "git {args:?} in {}", dir.display());
+}
+
+#[test]
+fn remote_only_ignored_dirs_and_hopbox_files_survive_resync() {
+    let Some(s) = common::sshd() else { return };
+    let d = tempfile::tempdir().unwrap();
+    let root = repo(d.path());
+    std::fs::remove_dir_all(root.join("target")).unwrap();
+    run_sync(&s, &root, &[]);
+    let made = s.ssh(
+        "cd ~/.cache/hopbox/ws/my_repo-test && mkdir -p target && echo cache > target/obj \
+         && touch .hopbox.lock .hopbox-last-used",
+    );
+    assert!(made.status.success());
+    run_sync(&s, &root, &[]);
+    let files = remote_files(&s);
+    for kept in ["./target/obj", "./.hopbox.lock", "./.hopbox-last-used"] {
+        assert!(
+            files.contains(&kept.to_string()),
+            "{kept} deleted: {files:?}"
+        );
+    }
+}
+
+#[test]
+fn submodule_ignores_are_honored() {
+    let Some(s) = common::sshd() else { return };
+    let d = tempfile::tempdir().unwrap();
+    let lib = d.path().join("lib");
+    write(&lib, ".gitignore", "node_modules/\n");
+    write(&lib, "index.js", "\n");
+    git_ok(&d.path().join("lib"), &["init", "-q"]);
+    git_ok(&lib, &["add", "."]);
+    git_ok(&lib, &["commit", "-qm", "init"]);
+    let root = repo(d.path());
+    git_ok(
+        &root,
+        &[
+            "submodule",
+            "add",
+            "-q",
+            lib.to_str().unwrap(),
+            "vendor/lib",
+        ],
+    );
+    write(&root, "vendor/lib/node_modules/big.js", "\n");
+    run_sync(&s, &root, &[]);
+    let files = remote_files(&s);
+    assert!(
+        files.contains(&"./vendor/lib/index.js".to_string()),
+        "{files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.contains("node_modules")),
+        "{files:?}"
+    );
+}
+
+#[test]
+fn non_utf8_ignored_name_is_not_synced() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(s) = common::sshd() else { return };
+    let d = tempfile::tempdir().unwrap();
+    let root = repo(d.path());
+    write(&root, ".gitignore", "target/\ndata/\n*.log\n");
+    let bad = root.join(std::ffi::OsStr::from_bytes(b"bad\xff.log"));
+    std::fs::write(&bad, "x\n").unwrap();
+    run_sync(&s, &root, &[]);
+    let out = s.ssh("cd ~/.cache/hopbox/ws/my_repo-test && ls -A | grep -c log || true");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
+}
