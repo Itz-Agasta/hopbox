@@ -1,0 +1,239 @@
+mod common;
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use hopbox::config::{GlobalConfig, HostConfig, RepoConfig, RunFlags, resolve};
+use hopbox::sync::sync;
+use hopbox::transport::Transport;
+use hopbox::workspace::{LocalTree, remote_workspace};
+
+fn write(root: &Path, rel: &str, body: &str) {
+    let p = root.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, body).unwrap();
+}
+
+/// A git repo in a dir with a space, with ignored dirs and secrets.
+fn repo(base: &Path) -> PathBuf {
+    let root = base.join("my repo");
+    write(&root, "src/a.rs", "fn main() {}\n");
+    write(&root, ".gitignore", "target/\ndata/\n");
+    write(&root, "target/x", "build output\n");
+    write(&root, "data/keep.bin", "keep\n");
+    write(&root, "data/skip.bin", "skip\n");
+    write(&root, ".env", "TOKEN=secret\n");
+    write(&root, "id_ed25519", "key\n");
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    root
+}
+
+fn run_sync(s: &common::Sshd, root: &Path, include: &[&str]) {
+    let global = GlobalConfig {
+        default_host: None,
+        hosts: [(s.host.to_string(), HostConfig::default())].into(),
+    };
+    let flags = RunFlags {
+        host: Some(s.host.into()),
+        include: include.iter().map(|x| x.to_string()).collect(),
+        ..RunFlags::default()
+    };
+    let r = resolve(&global, &RepoConfig::default(), &flags).unwrap();
+    let t = Transport::with_config(s.host, Some(s.ssh_config.clone()), s.dir.path().join("cm"))
+        .unwrap();
+    let ws = remote_workspace(&r.workspace_root, "my_repo-test");
+    t.preflight(&ws).unwrap();
+    let tree = LocalTree::discover(root).unwrap();
+    sync(&t, &tree, &ws, &r).unwrap();
+}
+
+fn remote_files(s: &common::Sshd) -> Vec<String> {
+    let out = s.ssh("cd ~/.cache/hopbox/ws/my_repo-test && find . -mindepth 1 | sort");
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn sync_respects_gitignore_and_secrets() {
+    let Some(s) = common::sshd() else { return };
+    let d = tempfile::tempdir().unwrap();
+    let root = repo(d.path());
+    run_sync(&s, &root, &[]);
+    let files = remote_files(&s);
+    assert!(files.contains(&"./src/a.rs".to_string()), "{files:?}");
+    assert!(files.contains(&"./.gitignore".to_string()), "{files:?}");
+    for absent in ["./target", "./data", "./.env", "./id_ed25519", "./.git"] {
+        assert!(
+            !files
+                .iter()
+                .any(|f| f == absent || f.starts_with(&format!("{absent}/"))),
+            "{absent} synced: {files:?}"
+        );
+    }
+}
+
+#[test]
+fn include_overrides_gitignore_not_secrets() {
+    let Some(s) = common::sshd() else { return };
+    let d = tempfile::tempdir().unwrap();
+    let root = repo(d.path());
+    run_sync(&s, &root, &["data/keep.bin", ".env"]);
+    let files = remote_files(&s);
+    assert!(files.contains(&"./data/keep.bin".to_string()), "{files:?}");
+    assert!(!files.contains(&"./data/skip.bin".to_string()), "{files:?}");
+    assert!(!files.contains(&"./.env".to_string()), "{files:?}");
+}
+
+#[test]
+fn resync_deletes_removed_files() {
+    let Some(s) = common::sshd() else { return };
+    let d = tempfile::tempdir().unwrap();
+    let root = repo(d.path());
+    run_sync(&s, &root, &[]);
+    std::fs::remove_file(root.join("src/a.rs")).unwrap();
+    write(&root, "src/b.rs", "\n");
+    run_sync(&s, &root, &[]);
+    let files = remote_files(&s);
+    assert!(!files.contains(&"./src/a.rs".to_string()), "{files:?}");
+    assert!(files.contains(&"./src/b.rs".to_string()), "{files:?}");
+}
+
+#[test]
+fn gitignore_negation_is_honored() {
+    let Some(s) = common::sshd() else { return };
+    let d = tempfile::tempdir().unwrap();
+    let root = repo(d.path());
+    write(
+        &root,
+        ".gitignore",
+        "target/\ndata/\n*.txt\n!requirements.txt\n",
+    );
+    write(&root, "requirements.txt", "serde\n");
+    write(&root, "notes.txt", "private\n");
+    write(&root, "sub/.gitignore", "local.cfg\n");
+    write(&root, "sub/local.cfg", "x\n");
+    write(&root, "sub/keep.rs", "\n");
+    run_sync(&s, &root, &[]);
+    let files = remote_files(&s);
+    assert!(
+        files.contains(&"./requirements.txt".to_string()),
+        "{files:?}"
+    );
+    assert!(!files.contains(&"./notes.txt".to_string()), "{files:?}");
+    assert!(files.contains(&"./sub/keep.rs".to_string()), "{files:?}");
+    assert!(!files.contains(&"./sub/local.cfg".to_string()), "{files:?}");
+}
+
+#[test]
+fn include_with_glob_chars_is_literal() {
+    let Some(s) = common::sshd() else { return };
+    let d = tempfile::tempdir().unwrap();
+    let root = repo(d.path());
+    write(&root, "data/[ab].txt", "literal\n");
+    write(&root, "data/a.txt", "sibling\n");
+    run_sync(&s, &root, &["data/[ab].txt"]);
+    let files = remote_files(&s);
+    assert!(files.contains(&"./data/[ab].txt".to_string()), "{files:?}");
+    assert!(!files.contains(&"./data/a.txt".to_string()), "{files:?}");
+}
+
+fn git_ok(dir: &Path, args: &[&str]) {
+    let ok = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "protocol.file.allow=always",
+        ])
+        .args(args)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok, "git {args:?} in {}", dir.display());
+}
+
+#[test]
+fn remote_only_ignored_dirs_and_hopbox_files_survive_resync() {
+    let Some(s) = common::sshd() else { return };
+    let d = tempfile::tempdir().unwrap();
+    let root = repo(d.path());
+    std::fs::remove_dir_all(root.join("target")).unwrap();
+    run_sync(&s, &root, &[]);
+    let made = s.ssh(
+        "cd ~/.cache/hopbox/ws/my_repo-test && mkdir -p target && echo cache > target/obj \
+         && touch .hopbox.lock .hopbox-last-used",
+    );
+    assert!(made.status.success());
+    run_sync(&s, &root, &[]);
+    let files = remote_files(&s);
+    for kept in ["./target/obj", "./.hopbox.lock", "./.hopbox-last-used"] {
+        assert!(
+            files.contains(&kept.to_string()),
+            "{kept} deleted: {files:?}"
+        );
+    }
+}
+
+#[test]
+fn submodule_ignores_are_honored() {
+    let Some(s) = common::sshd() else { return };
+    let d = tempfile::tempdir().unwrap();
+    let lib = d.path().join("lib");
+    write(&lib, ".gitignore", "node_modules/\n");
+    write(&lib, "index.js", "\n");
+    git_ok(&d.path().join("lib"), &["init", "-q"]);
+    git_ok(&lib, &["add", "."]);
+    git_ok(&lib, &["commit", "-qm", "init"]);
+    let root = repo(d.path());
+    git_ok(
+        &root,
+        &[
+            "submodule",
+            "add",
+            "-q",
+            lib.to_str().unwrap(),
+            "vendor/lib",
+        ],
+    );
+    write(&root, "vendor/lib/node_modules/big.js", "\n");
+    run_sync(&s, &root, &[]);
+    let files = remote_files(&s);
+    assert!(
+        files.contains(&"./vendor/lib/index.js".to_string()),
+        "{files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.contains("node_modules")),
+        "{files:?}"
+    );
+}
+
+#[test]
+fn non_utf8_ignored_name_is_not_synced() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(s) = common::sshd() else { return };
+    let d = tempfile::tempdir().unwrap();
+    let root = repo(d.path());
+    write(&root, ".gitignore", "target/\ndata/\n*.log\n");
+    let bad = root.join(std::ffi::OsStr::from_bytes(b"bad\xff.log"));
+    std::fs::write(&bad, "x\n").unwrap();
+    run_sync(&s, &root, &[]);
+    let out = s.ssh("cd ~/.cache/hopbox/ws/my_repo-test && ls -A | grep -c log || true");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
+}
