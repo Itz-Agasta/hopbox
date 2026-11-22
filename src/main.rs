@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use hopbox::cli::{self, Command};
 use hopbox::config::global_config_path;
+use hopbox::doctor;
 use hopbox::exit;
 use hopbox::run::{self, DEFAULT_LOCK_WAIT_SECS, LOCK_WAIT_ENV};
 use hopbox::status::Status;
@@ -39,6 +40,15 @@ fn main() -> ExitCode {
             });
             ExitCode::from(u8::try_from(status.exit).unwrap_or(1))
         }
+        Command::Doctor { host } => match env() {
+            Ok(env) => {
+                ExitCode::from(u8::try_from(doctor::execute(host.as_deref(), &env)).unwrap_or(1))
+            }
+            Err(e) => {
+                eprintln!("hopbox: {e:#}");
+                ExitCode::from(exit::USAGE)
+            }
+        },
     }
 }
 

@@ -26,6 +26,8 @@ pub struct Resolved {
     pub cpu_weight: Option<u16>,
     pub shell: Vec<String>,
     pub workspace_root: String,
+    /// Label only; shown by doctor.
+    pub cost: Option<String>,
     pub exclude: Vec<String>,
     pub include: Vec<String>,
     pub fetch: Vec<String>,
@@ -79,6 +81,7 @@ pub fn resolve(
             .workspace_root
             .clone()
             .unwrap_or_else(|| DEFAULT_WORKSPACE_ROOT.to_owned()),
+        cost: host.cost.clone(),
         exclude: repo.exclude.clone(),
         include: concat(&repo.include, &flags.include),
         fetch: concat(&repo.fetch, &flags.fetch),
