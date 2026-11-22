@@ -260,12 +260,14 @@ pub fn ignored_ancestors(root: &Path, includes: &[String]) -> Result<Vec<String>
     Ok(found)
 }
 
-/// Sync `tree` into `ws` on the transport's host.
+/// Sync `tree` into `ws` on the transport's host. `on_spawn` gets rsync's pid, so a signal
+/// handler can stop it.
 pub fn sync(
     t: &Transport,
     tree: &LocalTree,
     ws: &RemotePath,
     r: &Resolved,
+    on_spawn: &dyn Fn(u32),
 ) -> Result<(), SyncError> {
     let rsh = t.rsync_rsh();
     let ignored = ignored_ancestors(&tree.root, &r.include)?;
@@ -289,6 +291,7 @@ pub fn sync(
             Stdio::null()
         })
         .spawn()?;
+    on_spawn(child.id());
     if let (Some(list), Some(mut stdin)) = (&git_list, child.stdin.take()) {
         use std::io::Write;
         // rsync reads the whole list before transferring; a write error surfaces as its exit code.

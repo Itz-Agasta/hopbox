@@ -108,7 +108,12 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     let holder = acquire_lock(&t, &ws, env.lock_wait_secs, &interrupt)?;
 
     if !args.no_sync {
-        sync(&t, &tree, &ws, &r).map_err(|e| match e {
+        let synced = sync(&t, &tree, &ws, &r, &|pid| track_pid(pid, &interrupt));
+        CHILD_PID.store(0, Ordering::SeqCst);
+        if interrupt.load(Ordering::SeqCst) {
+            return Err(interrupted());
+        }
+        synced.map_err(|e| match e {
             SyncError::Rsync(code @ (12 | 255)) => (
                 exit::CONNECT.into(),
                 format!("sync failed: rsync exit {code}"),
@@ -117,10 +122,6 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
             other => usage(other),
         })?;
     }
-    if interrupt.load(Ordering::SeqCst) {
-        return Err(interrupted());
-    }
-
     if caps.is_none() {
         eprintln!("hopbox: warning: no resource caps on {}", r.host_name);
     }
@@ -166,6 +167,14 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         );
         st.log = log.as_ref().map(|l| l.path.clone());
         return Ok(st);
+    }
+    // A forwarder can block on a stalled stdout reader; keep Ctrl-C able to end the run.
+    while !(out.is_finished() && err.is_finished()) {
+        if interrupt.load(Ordering::SeqCst) {
+            wait_for_stop();
+            return Err(interrupted());
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
     let write_errors: Vec<String> = [out, err]
         .into_iter()
@@ -358,9 +367,13 @@ static STOP_DONE: Mutex<Option<Receiver<()>>> = Mutex::new(None);
 
 /// Publish the child's pid for the signal handler; kill it at once if a signal already came.
 fn track_child(child: &Child, interrupt: &AtomicBool) {
-    CHILD_PID.store(child.id(), Ordering::SeqCst);
+    track_pid(child.id(), interrupt);
+}
+
+fn track_pid(pid: u32, interrupt: &AtomicBool) {
+    CHILD_PID.store(pid, Ordering::SeqCst);
     if interrupt.load(Ordering::SeqCst) {
-        kill_pid(child.id());
+        kill_pid(pid);
     }
 }
 
