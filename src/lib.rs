@@ -4,4 +4,6 @@ pub mod config;
 pub mod exit;
 pub mod quote;
 pub mod remote_script;
+pub mod sync;
 pub mod transport;
+pub mod workspace;

@@ -49,6 +49,22 @@ impl RemotePath {
         }
     }
 
+    /// The path as rsync's remote side expects it: relative paths resolve against home.
+    pub fn rsync_arg(&self) -> String {
+        match self {
+            RemotePath::Home(rel) if rel.is_empty() => ".".to_owned(),
+            RemotePath::Home(rel) => rel.clone(),
+            RemotePath::Abs(path) => path.clone(),
+        }
+    }
+
+    /// The path text without rendering: home-relative or absolute.
+    pub fn raw(&self) -> &str {
+        match self {
+            RemotePath::Home(p) | RemotePath::Abs(p) => p,
+        }
+    }
+
     /// Render for `sh`: `$HOME` expands on the remote, the rest is quoted.
     pub fn render(&self) -> String {
         match self {
