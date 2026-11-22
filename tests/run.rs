@@ -299,6 +299,155 @@ fn interrupt_exits_130() {
     );
 }
 
+fn write_repo_config(e: &Env, body: &str) {
+    std::fs::write(e.root.join(".hopbox.toml"), body).unwrap();
+}
+
+#[test]
+fn task_runs_with_extra_args() {
+    let Some(s) = common::sshd() else { return };
+    let e = setup(&s);
+    write_repo_config(&e, "[tasks]\nhi = \"echo hi\"\n");
+    let o = run(&s, &e, &["run", "--task", "hi", "--", "there"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "hi there\n");
+}
+
+#[test]
+fn unknown_task_is_125() {
+    let Some(s) = common::sshd() else { return };
+    let e = setup(&s);
+    write_repo_config(&e, "[tasks]\nhi = \"echo hi\"\ntest = \"true\"\n");
+    let o = run(&s, &e, &["run", "--task", "nope"]);
+    assert_eq!(o.status.code(), Some(125));
+    let last = last_stderr_line(&o);
+    assert!(
+        last.contains("unknown task") && last.contains("hi, test"),
+        "{last}"
+    );
+}
+
+#[test]
+fn env_forwarded_exactly() {
+    let Some(s) = common::sshd() else { return };
+    let e = setup(&s);
+    let value = "a'b \"$c\"\nd";
+    let o = hopbox(
+        &s,
+        &e,
+        &e.sub,
+        &["run", "--env", "X", "--", "printf", "%s", "\"$X\""],
+    )
+    .env("X", value)
+    .output()
+    .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(String::from_utf8_lossy(&o.stdout), value);
+    let left = s.ssh("ls -A ~/.cache/hopbox/ws/*/ | grep -c hopbox-env || true");
+    assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "0");
+}
+
+#[test]
+fn env_unset_flag_is_125() {
+    let Some(s) = common::sshd() else { return };
+    let e = setup(&s);
+    let o = hopbox(
+        &s,
+        &e,
+        &e.sub,
+        &["run", "--env", "HOPBOX_SURELY_UNSET", "--", "true"],
+    )
+    .env_remove("HOPBOX_SURELY_UNSET")
+    .output()
+    .unwrap();
+    assert_eq!(o.status.code(), Some(125));
+    assert!(last_stderr_line(&o).contains("HOPBOX_SURELY_UNSET"));
+}
+
+#[test]
+fn repo_env_unset_warns_and_runs() {
+    let Some(s) = common::sshd() else { return };
+    let e = setup(&s);
+    write_repo_config(&e, "env = [\"HOPBOX_SURELY_UNSET\"]\n");
+    let o = run(&s, &e, &["run", "--", "true"]);
+    assert!(o.status.success());
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("env HOPBOX_SURELY_UNSET is not set locally")
+    );
+}
+
+#[test]
+fn fetch_copies_back() {
+    let Some(s) = common::sshd() else { return };
+    let e = setup(&s);
+    let o = run(
+        &s,
+        &e,
+        &[
+            "run",
+            "--fetch",
+            "out",
+            "--fetch",
+            "single.txt",
+            "--",
+            "mkdir -p out && echo r > out/report.txt && echo s > single.txt",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        std::fs::read_to_string(e.sub.join("out/report.txt")).unwrap(),
+        "r\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(e.sub.join("single.txt")).unwrap(),
+        "s\n"
+    );
+}
+
+#[test]
+fn fetch_on_failure() {
+    let Some(s) = common::sshd() else { return };
+    let e = setup(&s);
+    write_repo_config(&e, "fetch = [\"crates/a b/log.txt\"]\n");
+    // Repo fetch paths are relative to the current subdir as well.
+    let o = hopbox(
+        &s,
+        &e,
+        &e.root,
+        &[
+            "run",
+            "--",
+            "mkdir -p 'crates/a b' && echo failed > 'crates/a b/log.txt'; exit 2",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(
+        std::fs::read_to_string(e.sub.join("log.txt")).unwrap(),
+        "failed\n"
+    );
+}
+
+#[test]
+fn fetch_missing_warns() {
+    let Some(s) = common::sshd() else { return };
+    let e = setup(&s);
+    let o = run(&s, &e, &["run", "--fetch", "nothere", "--", "exit", "3"]);
+    assert_eq!(o.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("hopbox: warning: fetch nothere failed"));
+}
+
+#[test]
+fn fetch_rejects_escape() {
+    let Some(s) = common::sshd() else { return };
+    let e = setup(&s);
+    for bad in ["../x", "/etc/passwd"] {
+        let o = run(&s, &e, &["run", "--fetch", bad, "--", "true"]);
+        assert_eq!(o.status.code(), Some(125), "{bad}");
+    }
+}
+
 #[test]
 fn sync_waits_for_the_lock() {
     let Some(s) = common::sshd() else { return };

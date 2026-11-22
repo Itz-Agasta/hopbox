@@ -12,13 +12,15 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::cli::{RunArgs, command_string};
-use crate::config::{self, RunFlags};
+use crate::config::{self, Resolved, RunFlags};
 use crate::exit;
+use crate::quote::shell_quote;
 use crate::remote_script::{
-    Caps, LOCKED_LINE, LockScript, RunScript, UnitName, oom_check_script, stop_script,
+    Caps, LOCKED_LINE, LockScript, RemotePath, RunScript, UnitName, env_write_script,
+    oom_check_script, stop_script,
 };
 use crate::status::{Source, Status};
-use crate::sync::{SyncError, sync};
+use crate::sync::{SyncError, relative_path, sync};
 use crate::transport::{Transport, TransportError};
 use crate::workspace::{LocalTree, local_hostname, remote_workspace, workspace_name};
 
@@ -59,17 +61,6 @@ fn interrupted() -> Failure {
 }
 
 fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<Status, Failure> {
-    for (flag, used) in [
-        ("--fetch", !args.fetch.is_empty()),
-        ("--env", !args.env.is_empty()),
-        ("--task", args.task.is_some()),
-    ] {
-        if used {
-            return Err(usage(format!("{flag} is not implemented yet")));
-        }
-    }
-    let cmd = command_string(&args.cmd).ok_or_else(|| usage("no command: pass it after --"))?;
-
     let tree = LocalTree::discover(&env.cwd).map_err(usage)?;
     let global = match &env.global_config {
         Some(p) => config::load_global(p).map_err(usage)?,
@@ -85,6 +76,19 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     };
     let r = config::resolve(&global, &repo, &flags).map_err(usage)?;
     *host = r.host_name.clone();
+    let cmd = command_for(args, &r)?;
+    let fetch = r
+        .fetch
+        .iter()
+        .map(|p| {
+            relative_path(p).ok_or_else(|| {
+                usage(format!(
+                    "invalid fetch path {p:?}: use a path relative to the current directory without '..'"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let env_file_body = env_file_contents(&args.env, &repo.env)?;
 
     let t = Transport::new(&r.ssh_dest).map_err(usage)?;
     let ws = remote_workspace(
@@ -122,6 +126,22 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
             other => usage(other),
         })?;
     }
+    let env_file = format!(".hopbox-env-{}", unit.id());
+    let env_file = if env_file_body.is_empty() {
+        None
+    } else {
+        let out = t
+            .capture_input(&env_write_script(&ws, &env_file), env_file_body.as_bytes())
+            .map_err(usage)?;
+        if !out.status.success() {
+            return Err(usage(format!(
+                "cannot write the env file on {}: {}",
+                r.host_name,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Some(env_file)
+    };
     if caps.is_none() {
         eprintln!("hopbox: warning: no resource caps on {}", r.host_name);
     }
@@ -131,6 +151,7 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         caps: caps.as_ref(),
         shell: &r.shell,
         cmd: &cmd,
+        env_file: env_file.as_deref(),
     }
     .render();
 
@@ -210,6 +231,7 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
             }
         }
     }
+    fetch_back(&t, &ws, &tree, &fetch);
     holder.release();
     Ok(result)
 }
@@ -236,7 +258,7 @@ impl Drop for LockHolder {
 /// Start the lock holder and wait until it reports `locked` (or fails).
 fn acquire_lock(
     t: &Transport,
-    ws: &crate::remote_script::RemotePath,
+    ws: &RemotePath,
     wait_secs: u64,
     interrupt: &AtomicBool,
 ) -> Result<LockHolder, Failure> {
@@ -266,6 +288,97 @@ fn acquire_lock(
         ),
         code => usage(format!("cannot lock the workspace (exit {code:?})")),
     })
+}
+
+/// The command from `--task NAME` (plus extra words) or from the words after `--`.
+fn command_for(args: &RunArgs, r: &Resolved) -> Result<String, Failure> {
+    let extra = command_string(&args.cmd);
+    let Some(name) = &args.task else {
+        return extra.ok_or_else(|| usage("no command: pass it after -- or use --task NAME"));
+    };
+    let base = r.tasks.get(name).ok_or_else(|| {
+        let known = if r.tasks.is_empty() {
+            "none".to_owned()
+        } else {
+            r.tasks.keys().cloned().collect::<Vec<_>>().join(", ")
+        };
+        usage(format!("unknown task {name:?}; tasks: {known}"))
+    })?;
+    Ok(match extra {
+        Some(extra) => format!("{base} {extra}"),
+        None => base.clone(),
+    })
+}
+
+/// `export NAME='value'` lines for the env file. `--env` names must be set locally;
+/// names from the repo config that are unset are skipped with a warning.
+fn env_file_contents(flag_names: &[String], repo_names: &[String]) -> Result<String, Failure> {
+    let mut out = String::new();
+    let mut seen: Vec<&str> = Vec::new();
+    let all = flag_names
+        .iter()
+        .map(|n| (n, true))
+        .chain(repo_names.iter().map(|n| (n, false)));
+    for (name, from_flag) in all {
+        if seen.contains(&name.as_str()) {
+            continue;
+        }
+        seen.push(name);
+        let valid = name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return Err(usage(format!("invalid environment variable name {name:?}")));
+        }
+        match std::env::var(name) {
+            Ok(value) => out += &format!("export {name}={}\n", shell_quote(&value)),
+            Err(_) if from_flag => {
+                return Err(usage(format!(
+                    "--env {name}: not set locally (or not UTF-8)"
+                )));
+            }
+            Err(_) => eprintln!("hopbox: warning: env {name} is not set locally; skipping"),
+        }
+    }
+    Ok(out)
+}
+
+/// Copy each path back from the remote copy of the current subdirectory. Failures warn only.
+fn fetch_back(t: &Transport, ws: &RemotePath, tree: &LocalTree, paths: &[String]) {
+    let local_cwd = tree.root.join(&tree.subdir);
+    for p in paths {
+        let mut remote = ws.rsync_arg();
+        for part in [tree.subdir.as_str(), p.as_str()] {
+            if !part.is_empty() {
+                remote.push('/');
+                remote.push_str(part);
+            }
+        }
+        let parent = local_cwd.join(Path::new(p).parent().unwrap_or(Path::new("")));
+        let status = std::fs::create_dir_all(&parent).and_then(|_| {
+            let mut dest = parent.into_os_string();
+            dest.push("/");
+            std::process::Command::new("rsync")
+                .args(["-a", "-s", "-e"])
+                .arg(t.rsync_rsh())
+                .arg(format!("{}:{remote}", t.dest()))
+                .arg(dest)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+        });
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!(
+                "hopbox: warning: fetch {p} failed (rsync exit {})",
+                s.code().unwrap_or(-1)
+            ),
+            Err(e) => eprintln!("hopbox: warning: fetch {p} failed ({e})"),
+        }
+    }
 }
 
 fn exit_code(status: ExitStatus) -> i32 {

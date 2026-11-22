@@ -102,6 +102,11 @@ impl UnitName {
         &self.0
     }
 
+    /// The 8-hex id without the `hopbox-` prefix.
+    pub fn id(&self) -> &str {
+        self.0.trim_start_matches("hopbox-")
+    }
+
     /// The full unit name. systemctl needs the `.scope` suffix: a bare name resolves to `.service`.
     pub fn scope(&self) -> String {
         format!("{}.scope", self.0)
@@ -154,11 +159,17 @@ pub struct RunScript<'a> {
     pub caps: Option<&'a Caps>,
     pub shell: &'a [String],
     pub cmd: &'a str,
+    /// Env file in the workspace written by [`env_write_script`]: sourced, then deleted.
+    pub env_file: Option<&'a str>,
 }
 
 impl RunScript<'_> {
     pub fn render(&self) -> String {
         let mut s = format!("cd {} && ", self.workspace.render());
+        if let Some(f) = self.env_file {
+            let f = shell_quote(f);
+            s += &format!(". ./{f} && rm -f ./{f} && ");
+        }
         if !self.subdir.is_empty() {
             // `./` stops a leading `-` being read as an option and keeps CDPATH out of it.
             s += &format!("cd ./{} && ", shell_quote(self.subdir));
@@ -202,6 +213,16 @@ pub fn oom_check_script(unit: &UnitName) -> String {
 /// Stop the job's scope, killing every process in its cgroup.
 pub fn stop_script(unit: &UnitName) -> String {
     format!("systemctl --user stop {}", shell_quote(&unit.scope()))
+}
+
+/// Write stdin to `<ws>/<name>` readable only by the remote user. Env values travel on
+/// stdin, never on a command line.
+pub fn env_write_script(ws: &RemotePath, name: &str) -> String {
+    format!(
+        "cd {} && umask 077 && cat > {}",
+        ws.render(),
+        shell_quote(name)
+    )
 }
 
 /// Create the workspace and report whether `systemd-run --user --scope` works: prints `caps=1` or `caps=0`.
@@ -316,6 +337,7 @@ mod tests {
             caps: Some(&caps),
             shell: &shell,
             cmd: "cargo nextest run",
+            env_file: None,
         };
         assert_eq!(
             script.render(),
@@ -339,6 +361,7 @@ mod tests {
             caps: None,
             shell,
             cmd,
+            env_file: None,
         }
     }
 
@@ -424,6 +447,27 @@ mod tests {
         assert_eq!(
             preflight_script(&ws),
             r#"mkdir -p "$HOME"/'my cache/ws' && if systemd-run --user --scope --quiet true >/dev/null 2>&1; then echo caps=1; else echo caps=0; fi"#
+        );
+    }
+
+    #[test]
+    fn run_script_sources_and_removes_env_file() {
+        let ws = RemotePath::parse("/w");
+        let shell = words(&["sh", "-c"]);
+        let s = RunScript {
+            env_file: Some(".hopbox-env-deadbeef"),
+            ..uncapped(&ws, "sub", &shell, "true")
+        }
+        .render();
+        assert!(
+            s.contains(
+                "cd /w && . ./.hopbox-env-deadbeef && rm -f ./.hopbox-env-deadbeef && cd ./sub && exec "
+            ),
+            "{s}"
+        );
+        assert_eq!(
+            env_write_script(&ws, ".hopbox-env-deadbeef"),
+            "cd /w && umask 077 && cat > .hopbox-env-deadbeef"
         );
     }
 

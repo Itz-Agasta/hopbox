@@ -115,6 +115,21 @@ impl Transport {
             .spawn()?)
     }
 
+    /// Run a script with `input` on its stdin and collect its output.
+    pub fn capture_input(&self, script: &str, input: &[u8]) -> Result<Output, TransportError> {
+        use std::io::Write;
+        let mut child = self
+            .command(script, false)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(input)?;
+        }
+        Ok(child.wait_with_output()?)
+    }
+
     /// Start a script with stdout and stderr piped and stdin inherited.
     pub fn spawn(&self, script: &str, tty: bool) -> Result<Child, TransportError> {
         Ok(self

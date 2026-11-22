@@ -71,6 +71,7 @@ impl RsyncSpec<'_> {
         // hopbox's own remote-only files must survive --delete (a running job holds the lock).
         a.push("--filter=P /.hopbox.lock".into());
         a.push("--filter=P /.hopbox-last-used".into());
+        a.push("--filter=P /.hopbox-env-*".into());
         // `.git` without a slash also covers a worktree's `.git` file.
         a.push("--exclude=.git".into());
         for secret in SECRET_EXCLUDES {
@@ -129,20 +130,23 @@ fn check_dest(ws: &RemotePath, workspace_root: &str) -> Result<(), SyncError> {
     Ok(())
 }
 
-/// Strip `./` and trailing `/`; reject absolute paths, `..`, and empty paths.
+/// A path relative to the repo or current dir: strips `./` and trailing `/`; `None` for
+/// absolute paths, `..`, and empty paths.
+pub fn relative_path(raw: &str) -> Option<String> {
+    let parts: Vec<&str> = raw
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    if raw.starts_with('/') || parts.is_empty() || parts.contains(&"..") {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
 fn normalize_includes(includes: &[String]) -> Result<Vec<String>, SyncError> {
     includes
         .iter()
-        .map(|raw| {
-            let parts: Vec<&str> = raw
-                .split('/')
-                .filter(|p| !p.is_empty() && *p != ".")
-                .collect();
-            if raw.starts_with('/') || parts.is_empty() || parts.contains(&"..") {
-                return Err(SyncError::BadInclude(raw.clone()));
-            }
-            Ok(parts.join("/"))
-        })
+        .map(|raw| relative_path(raw).ok_or_else(|| SyncError::BadInclude(raw.clone())))
         .collect()
 }
 
