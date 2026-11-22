@@ -3,3 +3,4 @@
 pub mod config;
 pub mod exit;
 pub mod quote;
+pub mod remote_script;
