@@ -105,6 +105,16 @@ impl Transport {
         Ok(self.command(script, false).stdin(Stdio::null()).output()?)
     }
 
+    /// Start a script with stdin and stdout piped and stderr inherited (the lock holder).
+    pub fn spawn_holder(&self, script: &str) -> Result<Child, TransportError> {
+        Ok(self
+            .command(script, false)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?)
+    }
+
     /// Start a script with stdout and stderr piped and stdin inherited.
     pub fn spawn(&self, script: &str, tty: bool) -> Result<Child, TransportError> {
         Ok(self

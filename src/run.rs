@@ -1,19 +1,21 @@
-//! `hopbox run`: preflight, sync, lock, exec, stream, report.
+//! `hopbox run`: preflight, lock, sync, exec, stream, report.
 
+use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
+use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cli::{RunArgs, command_string};
 use crate::config::{self, RunFlags};
 use crate::exit;
 use crate::remote_script::{
-    Caps, LOCK_TIMEOUT_LINE, RunScript, UnitName, oom_check_script, stop_script,
+    Caps, LOCKED_LINE, LockScript, RunScript, UnitName, oom_check_script, stop_script,
 };
 use crate::status::{Source, Status};
 use crate::sync::{SyncError, sync};
@@ -24,6 +26,8 @@ use crate::workspace::{LocalTree, local_hostname, remote_workspace, workspace_na
 pub const LOCK_WAIT_ENV: &str = "HOPBOX_LOCK_WAIT_SECS";
 /// Default time to wait for another run holding the workspace lock.
 pub const DEFAULT_LOCK_WAIT_SECS: u64 = 600;
+/// How long an interrupted run waits for the remote scope to stop.
+const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Process context the run needs, gathered once in `main`.
 #[derive(Debug, Clone)]
@@ -48,6 +52,10 @@ type Failure = (i32, String);
 
 fn usage(msg: impl std::fmt::Display) -> Failure {
     (exit::USAGE.into(), msg.to_string())
+}
+
+fn interrupted() -> Failure {
+    (exit::INTERRUPTED.into(), "interrupted".to_owned())
 }
 
 fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<Status, Failure> {
@@ -88,6 +96,17 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         _ => usage(e),
     })?;
 
+    let unit = UnitName::random();
+    let caps = pre.caps.then(|| Caps {
+        unit: unit.clone(),
+        memory_max: r.memory_max.clone(),
+        cpu_weight: r.cpu_weight,
+    });
+    let interrupt = install_interrupt(&t, caps.as_ref().map(|c| c.unit.clone()));
+
+    // One lock for sync, job and fetch, so a second run can't change files under this one.
+    let holder = acquire_lock(&t, &ws, env.lock_wait_secs, &interrupt)?;
+
     if !args.no_sync {
         sync(&t, &tree, &ws, &r).map_err(|e| match e {
             SyncError::Rsync(code @ (12 | 255)) => (
@@ -98,19 +117,16 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
             other => usage(other),
         })?;
     }
+    if interrupt.load(Ordering::SeqCst) {
+        return Err(interrupted());
+    }
 
-    let caps = pre.caps.then(|| Caps {
-        unit: UnitName::random(),
-        memory_max: r.memory_max.clone(),
-        cpu_weight: r.cpu_weight,
-    });
     if caps.is_none() {
         eprintln!("hopbox: warning: no resource caps on {}", r.host_name);
     }
     let script = RunScript {
         workspace: &ws,
         subdir: &tree.subdir,
-        lock_wait_secs: env.lock_wait_secs,
         caps: caps.as_ref(),
         shell: &r.shell,
         cmd: &cmd,
@@ -118,13 +134,12 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     .render();
 
     let log = match args.tail {
-        Some(_) => Some(open_log(&env.log_dir, caps.as_ref())?),
+        Some(_) => Some(open_log(&env.log_dir, &unit)?),
         None => None,
     };
-    let interrupt = install_interrupt(&t, caps.as_ref().map(|c| c.unit.clone()));
 
     let mut child = t.spawn(&script, env.stdout_tty).map_err(usage)?;
-    CHILD_PID.store(child.id(), Ordering::SeqCst);
+    track_child(&child, &interrupt);
     let out = forward(
         child.stdout.take().expect("piped"),
         Sink::Stdout,
@@ -140,7 +155,9 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         .map_err(|e| usage(format!("waiting for ssh: {e}")))?;
     if interrupt.load(Ordering::SeqCst) {
         // Under ControlMaster the master holds our pipes until the remote command ends, so
-        // joining the forwarders could wait on an orphaned job. Report and leave now.
+        // joining the forwarders could wait on an orphaned job. Give the scope stop a moment
+        // to finish, then report and leave.
+        wait_for_stop();
         let mut st = Status::hopbox_error(
             exit::INTERRUPTED.into(),
             &r.host_name,
@@ -150,8 +167,10 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         st.log = log.as_ref().map(|l| l.path.clone());
         return Ok(st);
     }
-    let last_out = out.join().unwrap_or_default();
-    let last_err = err.join().unwrap_or_default();
+    let write_errors: Vec<String> = [out, err]
+        .into_iter()
+        .filter_map(|h| h.join().ok().flatten())
+        .collect();
     CHILD_PID.store(0, Ordering::SeqCst);
 
     let mut result = Status {
@@ -161,18 +180,18 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         dur: start.elapsed(),
         log: log.as_ref().map(|l| l.path.clone()),
         oom: false,
-        error: None,
+        error: write_errors.first().map(|e| format!("log incomplete: {e}")),
     };
     if let (Some(n), Some(l)) = (args.tail, &log) {
-        print_tail(&l.path, n);
-    }
-
-    if result.exit == i32::from(exit::TIMEOUT)
-        && [last_out.as_str(), last_err.as_str()].contains(&LOCK_TIMEOUT_LINE)
-    {
-        result.source = Source::Hopbox;
-        result.error = Some("lock wait timed out".into());
-        return Ok(result);
+        match tail_lines(&l.path, n) {
+            Ok(lines) => {
+                let mut stdout = io::stdout().lock();
+                for line in lines {
+                    let _ = writeln!(stdout, "{line}");
+                }
+            }
+            Err(e) => result.error = Some(format!("cannot read log: {e}")),
+        }
     }
     if let Some(c) = &caps {
         if let Ok(o) = t.capture(&oom_check_script(&c.unit)) {
@@ -182,7 +201,62 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
             }
         }
     }
+    holder.release();
     Ok(result)
+}
+
+/// The lock-holder ssh session. Closing its stdin releases the lock.
+struct LockHolder {
+    child: Child,
+}
+
+impl LockHolder {
+    fn release(mut self) {
+        drop(self.child.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for LockHolder {
+    fn drop(&mut self) {
+        // Early returns: closing stdin is enough for the remote side to let go.
+        drop(self.child.stdin.take());
+    }
+}
+
+/// Start the lock holder and wait until it reports `locked` (or fails).
+fn acquire_lock(
+    t: &Transport,
+    ws: &crate::remote_script::RemotePath,
+    wait_secs: u64,
+    interrupt: &AtomicBool,
+) -> Result<LockHolder, Failure> {
+    let script = LockScript {
+        workspace: ws,
+        wait_secs,
+    }
+    .render();
+    let mut child = t.spawn_holder(&script).map_err(usage)?;
+    track_child(&child, interrupt);
+    let mut line = String::new();
+    let stdout = child.stdout.take().expect("piped");
+    let _ = BufReader::new(stdout).read_line(&mut line);
+    CHILD_PID.store(0, Ordering::SeqCst);
+    if line.trim_end() == LOCKED_LINE {
+        return Ok(LockHolder { child });
+    }
+    let status = child.wait().map_err(|e| usage(format!("lock: {e}")))?;
+    if interrupt.load(Ordering::SeqCst) {
+        return Err(interrupted());
+    }
+    Err(match status.code() {
+        Some(124) => (exit::TIMEOUT.into(), "lock wait timed out".to_owned()),
+        Some(255) => (
+            exit::CONNECT.into(),
+            format!("lost connection to {}", t.dest()),
+        ),
+        code => usage(format!("cannot lock the workspace (exit {code:?})")),
+    })
 }
 
 fn exit_code(status: ExitStatus) -> i32 {
@@ -198,11 +272,10 @@ struct Log {
     file: Mutex<File>,
 }
 
-fn open_log(dir: &Path, caps: Option<&Caps>) -> Result<Log, Failure> {
+fn open_log(dir: &Path, unit: &UnitName) -> Result<Log, Failure> {
     std::fs::create_dir_all(dir)
         .map_err(|e| usage(format!("cannot create {}: {e}", dir.display())))?;
-    let id = caps.map_or_else(UnitName::random, |c| c.unit.clone());
-    let path = dir.join(format!("{}.log", id.as_str()));
+    let path = dir.join(format!("{}.log", unit.as_str()));
     let file =
         File::create(&path).map_err(|e| usage(format!("cannot create {}: {e}", path.display())))?;
     Ok(Log {
@@ -211,15 +284,22 @@ fn open_log(dir: &Path, caps: Option<&Caps>) -> Result<Log, Failure> {
     })
 }
 
-fn print_tail(path: &Path, n: usize) {
-    let Ok(body) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let lines: Vec<&str> = body.lines().collect();
-    let mut stdout = io::stdout().lock();
-    for line in &lines[lines.len().saturating_sub(n)..] {
-        let _ = writeln!(stdout, "{line}");
+/// The last `n` lines of a file, read as a stream (bounded memory), decoded lossily.
+fn tail_lines(path: &Path, n: usize) -> io::Result<Vec<String>> {
+    let mut keep: VecDeque<Vec<u8>> = VecDeque::with_capacity(n.min(1024));
+    if n == 0 {
+        return Ok(Vec::new());
     }
+    for line in BufReader::new(File::open(path)?).split(b'\n') {
+        if keep.len() == n {
+            keep.pop_front();
+        }
+        keep.push_back(line?);
+    }
+    Ok(keep
+        .into_iter()
+        .map(|l| String::from_utf8_lossy(&l).into_owned())
+        .collect())
 }
 
 #[derive(Clone, Copy)]
@@ -229,26 +309,19 @@ enum Sink {
 }
 
 /// Copy a child stream to our stdout/stderr (or the log) as bytes arrive.
-/// Returns the last complete line, without its line ending.
+/// Returns the first log write error, if any.
 fn forward<R: Read + Send + 'static>(
     mut src: R,
     sink: Sink,
     log: Option<&Log>,
-) -> JoinHandle<String> {
+) -> JoinHandle<Option<String>> {
     let log = log.map(|l| {
         // Share the file handle across both forwarding threads.
-        Arc::new(
-            l.file
-                .lock()
-                .expect("log lock")
-                .try_clone()
-                .expect("clone log"),
-        )
+        Arc::new(l.file.lock().expect("log lock").try_clone())
     });
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
-        let mut current: Vec<u8> = Vec::new();
-        let mut last = String::new();
+        let mut write_error: Option<String> = None;
         loop {
             let n = match src.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -257,41 +330,56 @@ fn forward<R: Read + Send + 'static>(
             let chunk = &buf[..n];
             match &log {
                 Some(f) => {
-                    let _ = (&**f).write_all(chunk);
+                    let res = match &**f {
+                        Ok(file) => (&*file).write_all(chunk),
+                        Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+                    };
+                    if let (Err(e), None) = (res, &write_error) {
+                        write_error = Some(e.to_string());
+                    }
                 }
                 None => {
                     let _ = match sink {
-                        Sink::Stdout => io::stdout()
-                            .lock()
-                            .write_all(chunk)
-                            .and_then(|_| io::stdout().flush()),
+                        Sink::Stdout => {
+                            let mut out = io::stdout().lock();
+                            out.write_all(chunk).and_then(|_| out.flush())
+                        }
                         Sink::Stderr => io::stderr().lock().write_all(chunk),
                     };
                 }
             }
-            for &b in chunk {
-                if b == b'\n' {
-                    last = String::from_utf8_lossy(&current)
-                        .trim_end_matches('\r')
-                        .to_owned();
-                    current.clear();
-                } else {
-                    current.push(b);
-                }
-            }
         }
-        if !current.is_empty() {
-            last = String::from_utf8_lossy(&current)
-                .trim_end_matches('\r')
-                .to_owned();
-        }
-        last
+        write_error
     })
 }
 
 static CHILD_PID: AtomicU32 = AtomicU32::new(0);
+static STOP_DONE: Mutex<Option<Receiver<()>>> = Mutex::new(None);
 
-/// On Ctrl-C or SIGTERM: stop the remote scope (capped) or the local ssh (uncapped).
+/// Publish the child's pid for the signal handler; kill it at once if a signal already came.
+fn track_child(child: &Child, interrupt: &AtomicBool) {
+    CHILD_PID.store(child.id(), Ordering::SeqCst);
+    if interrupt.load(Ordering::SeqCst) {
+        kill_pid(child.id());
+    }
+}
+
+fn kill_pid(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+}
+
+/// Wait (bounded) for the remote scope stop started by the signal handler.
+fn wait_for_stop() {
+    let rx = STOP_DONE.lock().ok().and_then(|mut g| g.take());
+    if let Some(rx) = rx {
+        let _ = rx.recv_timeout(STOP_GRACE);
+    }
+}
+
+/// On Ctrl-C or SIGTERM: stop the remote scope (capped) in the background and terminate the
+/// local ssh right away.
 fn install_interrupt(t: &Transport, unit: Option<UnitName>) -> Arc<AtomicBool> {
     static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     static TARGET: Mutex<Option<(Transport, Option<UnitName>)>> = Mutex::new(None);
@@ -302,17 +390,48 @@ fn install_interrupt(t: &Transport, unit: Option<UnitName>) -> Arc<AtomicBool> {
         let _ = ctrlc::set_handler(move || {
             seen.store(true, Ordering::SeqCst);
             let target = TARGET.lock().ok().and_then(|g| g.clone());
-            if let Some((t, Some(unit))) = &target {
-                let _ = t.capture(&stop_script(unit));
+            if let Some((t, Some(unit))) = target {
+                let (tx, rx) = mpsc::channel();
+                if let Ok(mut g) = STOP_DONE.lock() {
+                    *g = Some(rx);
+                }
+                std::thread::spawn(move || {
+                    let _ = t.capture(&stop_script(&unit));
+                    let _ = tx.send(());
+                });
             }
             let pid = CHILD_PID.load(Ordering::SeqCst);
             if pid != 0 {
-                let _ = std::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status();
+                kill_pid(pid);
             }
         });
         flag
     })
     .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_lines_keeps_only_the_end() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("log");
+        let body: String = (1..=1000).map(|i| format!("{i}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+        assert_eq!(tail_lines(&p, 2).unwrap(), ["999", "1000"]);
+        assert!(tail_lines(&p, 0).unwrap().is_empty());
+        assert_eq!(tail_lines(&p, 5000).unwrap().len(), 1000);
+    }
+
+    #[test]
+    fn tail_lines_survives_invalid_utf8() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("log");
+        std::fs::write(&p, [b"bad \xff line\n".as_slice(), b"last\n"].concat()).unwrap();
+        let lines = tail_lines(&p, 2).unwrap();
+        assert_eq!(lines[1], "last");
+        assert!(lines[0].starts_with("bad "));
+    }
 }

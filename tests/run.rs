@@ -298,3 +298,28 @@ fn interrupt_exits_130() {
         last_stderr_line(&o)
     );
 }
+
+#[test]
+fn sync_waits_for_the_lock() {
+    let Some(s) = common::sshd() else { return };
+    let e = setup(&s);
+    assert!(run(&s, &e, &["run", "--", "true"]).status.success());
+    std::fs::write(e.root.join("README"), "edited\n").unwrap();
+    let held = s.ssh(
+        "for d in ~/.cache/hopbox/ws/*/; do nohup flock \"$d.hopbox.lock\" sleep 60 </dev/null >/dev/null 2>&1 & done; sleep 0.5",
+    );
+    assert!(held.status.success());
+    let o = hopbox(&s, &e, &e.sub, &["run", "--", "true"])
+        .env("HOPBOX_LOCK_WAIT_SECS", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(124),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    // The running job's files were not touched: sync waited for the lock and gave up.
+    let readme = s.ssh("cat ~/.cache/hopbox/ws/*/README");
+    assert_eq!(String::from_utf8_lossy(&readme.stdout), "hi\n");
+}

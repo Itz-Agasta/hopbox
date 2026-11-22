@@ -116,13 +116,40 @@ pub struct Caps {
     pub cpu_weight: Option<u16>,
 }
 
-/// The script that locks the workspace and runs the user's command.
+/// Printed on stdout by [`LockScript`] once it holds the workspace lock.
+pub const LOCKED_LINE: &str = "locked";
+
+/// Takes the workspace lock and holds it until its stdin closes. hopbox runs it in its own
+/// ssh session before syncing, so sync, job and fetch all happen under one lock, and nothing
+/// the job starts ever holds the lock fd.
+#[derive(Debug)]
+pub struct LockScript<'a> {
+    pub workspace: &'a RemotePath,
+    pub wait_secs: u64,
+}
+
+impl LockScript<'_> {
+    pub fn render(&self) -> String {
+        format!(
+            "cd {ws} && touch .hopbox-last-used && exec 9>.hopbox.lock && \
+             {{ flock -n 9 || {{ echo {wait} >&2; flock -w {secs} 9 || \
+             {{ echo {timeout} >&2; exit 124; }}; }}; }} && \
+             echo {locked} && exec cat >/dev/null",
+            ws = self.workspace.render(),
+            wait = shell_quote(LOCK_WAIT_LINE),
+            secs = self.wait_secs,
+            timeout = shell_quote(LOCK_TIMEOUT_LINE),
+            locked = LOCKED_LINE,
+        )
+    }
+}
+
+/// The script that runs the user's command in the workspace (the lock is held separately).
 #[derive(Debug)]
 pub struct RunScript<'a> {
     pub workspace: &'a RemotePath,
     /// Path of the current subdirectory relative to the worktree root, `/`-separated; empty at the root.
     pub subdir: &'a str,
-    pub lock_wait_secs: u64,
     /// `None` runs uncapped (no working `systemd-run --user` on the host).
     pub caps: Option<&'a Caps>,
     pub shell: &'a [String],
@@ -131,22 +158,12 @@ pub struct RunScript<'a> {
 
 impl RunScript<'_> {
     pub fn render(&self) -> String {
-        let mut s = format!(
-            "cd {ws} && touch .hopbox-last-used && exec 9>.hopbox.lock && \
-             {{ flock -n 9 || {{ echo {wait} >&2; flock -w {secs} 9 || \
-             {{ echo {timeout} >&2; exit 124; }}; }}; }} && ",
-            ws = self.workspace.render(),
-            wait = shell_quote(LOCK_WAIT_LINE),
-            secs = self.lock_wait_secs,
-            timeout = shell_quote(LOCK_TIMEOUT_LINE),
-        );
+        let mut s = format!("cd {} && ", self.workspace.render());
         if !self.subdir.is_empty() {
             // `./` stops a leading `-` being read as an option and keeps CDPATH out of it.
             s += &format!("cd ./{} && ", shell_quote(self.subdir));
         }
-        // No `exec`: this shell keeps the lock on fd 9 until the job exits, and the job runs
-        // with fd 9 closed so daemons it leaves behind (sccache, Gradle) never hold the lock.
-        // The script's exit status is the job's, since the job is its last command.
+        s += "exec ";
         if let Some(caps) = self.caps {
             s += &format!(
                 "systemd-run --user --scope --quiet --unit {} ",
@@ -168,7 +185,6 @@ impl RunScript<'_> {
             s += " ";
         }
         s += &shell_quote(self.cmd);
-        s += " 9>&-";
         s
     }
 }
@@ -297,7 +313,6 @@ mod tests {
         let script = RunScript {
             workspace: &ws,
             subdir: "",
-            lock_wait_secs: 30,
             caps: Some(&caps),
             shell: &shell,
             cmd: "cargo nextest run",
@@ -305,11 +320,9 @@ mod tests {
         assert_eq!(
             script.render(),
             concat!(
-                r#"cd "$HOME"/.cache/hopbox/ws/martin-1a2b3c4d && touch .hopbox-last-used && exec 9>.hopbox.lock && "#,
-                r#"{ flock -n 9 || { echo 'hopbox: waiting for lock…' >&2; flock -w 30 9 || "#,
-                r#"{ echo 'hopbox: lock wait timed out' >&2; exit 124; }; }; } && "#,
-                r#"systemd-run --user --scope --quiet --unit hopbox-deadbeef "#,
-                r#"-p MemoryMax=6G -p MemorySwapMax=0 -p CPUWeight=50 -- bash -lc 'cargo nextest run' 9>&-"#,
+                r#"cd "$HOME"/.cache/hopbox/ws/martin-1a2b3c4d && "#,
+                r#"exec systemd-run --user --scope --quiet --unit hopbox-deadbeef "#,
+                r#"-p MemoryMax=6G -p MemorySwapMax=0 -p CPUWeight=50 -- bash -lc 'cargo nextest run'"#,
             )
         );
     }
@@ -323,7 +336,6 @@ mod tests {
         RunScript {
             workspace: ws,
             subdir,
-            lock_wait_secs: 30,
             caps: None,
             shell,
             cmd,
@@ -335,7 +347,7 @@ mod tests {
         let ws = RemotePath::parse("/w");
         let shell = words(&["bash", "-lc"]);
         let s = uncapped(&ws, "", &shell, "cargo test").render();
-        assert!(s.ends_with("} && bash -lc 'cargo test' 9>&-"), "{s}");
+        assert!(s.ends_with("cd /w && exec bash -lc 'cargo test'"), "{s}");
         assert!(!s.contains("systemd-run"), "{s}");
     }
 
@@ -353,10 +365,7 @@ mod tests {
             ..uncapped(&ws, "", &shell, "true")
         }
         .render();
-        assert!(
-            s.contains("--unit hopbox-deadbeef -- bash -lc true 9>&-"),
-            "{s}"
-        );
+        assert!(s.contains("--unit hopbox-deadbeef -- bash -lc true"), "{s}");
         assert!(
             !s.contains("MemoryMax") && !s.contains("MemorySwapMax") && !s.contains("CPUWeight"),
             "{s}"
@@ -378,7 +387,7 @@ mod tests {
         let shell = words(&["sh", "-c"]);
         let s = uncapped(&ws, "crates/my crate", &shell, "true").render();
         assert!(
-            s.contains("} && cd ./'crates/my crate' && sh -c true 9>&-"),
+            s.contains("cd /w && cd ./'crates/my crate' && exec sh -c true"),
             "{s}"
         );
     }
@@ -407,38 +416,6 @@ mod tests {
         );
         // CDPATH must not make cd echo a path or pick another dir.
         assert_eq!(String::from_utf8(out.stdout).unwrap(), "-x\n");
-    }
-
-    #[test]
-    fn run_script_job_does_not_inherit_lock() {
-        if !have_flock() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let ws = RemotePath::Abs(dir.path().to_str().unwrap().to_owned());
-        let shell = words(&["sh", "-c"]);
-        // The job leaves a daemon behind, like sccache or a Gradle daemon.
-        let cmd = "sleep 30 >/dev/null 2>&1 & echo $! > daemon.pid";
-        let out = run_local(&uncapped(&ws, "", &shell, cmd).render());
-        assert!(out.status.success());
-        let pid = std::fs::read_to_string(dir.path().join("daemon.pid")).unwrap();
-        let _daemon = KillPidOnDrop(pid.trim().to_owned());
-        let free = Command::new("flock")
-            .arg("-n")
-            .arg(dir.path().join(".hopbox.lock"))
-            .arg("true")
-            .status()
-            .unwrap()
-            .success();
-        assert!(free, "a leftover daemon must not hold the workspace lock");
-    }
-
-    struct KillPidOnDrop(String);
-
-    impl Drop for KillPidOnDrop {
-        fn drop(&mut self) {
-            let _ = Command::new("kill").arg(&self.0).status();
-        }
     }
 
     #[test]
@@ -495,8 +472,6 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(String::from_utf8(out.stdout).unwrap(), "a|b c|d'e|sub dir|");
-        assert!(dir.path().join(".hopbox-last-used").exists());
-        assert!(dir.path().join(".hopbox.lock").exists());
     }
 
     #[test]
@@ -512,42 +487,112 @@ mod tests {
     }
 
     #[test]
-    fn run_script_lock_timeout_exits_124() {
-        if !have_flock() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let lock = dir.path().join(".hopbox.lock");
+    fn lock_script_golden() {
+        let ws = RemotePath::parse("/w");
+        assert_eq!(
+            LockScript {
+                workspace: &ws,
+                wait_secs: 30
+            }
+            .render(),
+            concat!(
+                "cd /w && touch .hopbox-last-used && exec 9>.hopbox.lock && ",
+                "{ flock -n 9 || { echo 'hopbox: waiting for lock…' >&2; flock -w 30 9 || ",
+                "{ echo 'hopbox: lock wait timed out' >&2; exit 124; }; }; } && ",
+                "echo locked && exec cat >/dev/null",
+            )
+        );
+    }
+
+    fn hold_lock(lock: &Path) -> KillOnDrop {
         let holder = KillOnDrop(
             // `exec` keeps one pid holding the lock fd, so killing it frees the lock.
             Command::new("sh")
                 .arg("-c")
                 .arg(r#"exec 9>"$1"; flock 9; exec sleep 30"#)
                 .arg("sh")
-                .arg(&lock)
+                .arg(lock)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap(),
         );
-        wait_until_locked(&lock);
+        wait_until_locked(lock);
+        holder
+    }
 
+    fn lock_free(lock: &Path) -> bool {
+        Command::new("flock")
+            .arg("-n")
+            .arg(lock)
+            .arg("true")
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    #[test]
+    fn lock_script_timeout_exits_124() {
+        if !have_flock() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let holder = hold_lock(&dir.path().join(".hopbox.lock"));
         let ws = RemotePath::Abs(dir.path().to_str().unwrap().to_owned());
-        let shell = words(&["sh", "-c"]);
-        let script = RunScript {
-            lock_wait_secs: 0,
-            ..uncapped(&ws, "", &shell, "echo ran")
-        };
-        let out = run_local(&script.render());
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(wrap_for_ssh(
+                &LockScript {
+                    workspace: &ws,
+                    wait_secs: 0,
+                }
+                .render(),
+            ))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
         drop(holder);
-
         assert_eq!(out.status.code(), Some(124));
-        assert!(out.stdout.is_empty(), "command must not run");
+        assert!(out.stdout.is_empty(), "must not report locked");
         let stderr = String::from_utf8(out.stderr).unwrap();
         assert_eq!(
             stderr.lines().collect::<Vec<_>>(),
             [LOCK_WAIT_LINE, LOCK_TIMEOUT_LINE]
         );
+    }
+
+    #[test]
+    fn lock_script_holds_until_stdin_closes() {
+        use std::io::{BufRead, BufReader};
+        if !have_flock() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(".hopbox.lock");
+        let ws = RemotePath::Abs(dir.path().to_str().unwrap().to_owned());
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(wrap_for_ssh(
+                &LockScript {
+                    workspace: &ws,
+                    wait_secs: 5,
+                }
+                .render(),
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, format!("{LOCKED_LINE}\n"));
+        assert!(dir.path().join(".hopbox-last-used").exists());
+        assert!(!lock_free(&lock), "lock must be held while stdin is open");
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        assert!(lock_free(&lock), "lock must be released when stdin closes");
     }
 
     struct KillOnDrop(std::process::Child);
