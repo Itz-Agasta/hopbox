@@ -108,3 +108,42 @@ fn resync_deletes_removed_files() {
     assert!(!files.contains(&"./src/a.rs".to_string()), "{files:?}");
     assert!(files.contains(&"./src/b.rs".to_string()), "{files:?}");
 }
+
+#[test]
+fn gitignore_negation_is_honored() {
+    let Some(s) = common::sshd() else { return };
+    let d = tempfile::tempdir().unwrap();
+    let root = repo(d.path());
+    write(
+        &root,
+        ".gitignore",
+        "target/\ndata/\n*.txt\n!requirements.txt\n",
+    );
+    write(&root, "requirements.txt", "serde\n");
+    write(&root, "notes.txt", "private\n");
+    write(&root, "sub/.gitignore", "local.cfg\n");
+    write(&root, "sub/local.cfg", "x\n");
+    write(&root, "sub/keep.rs", "\n");
+    run_sync(&s, &root, &[]);
+    let files = remote_files(&s);
+    assert!(
+        files.contains(&"./requirements.txt".to_string()),
+        "{files:?}"
+    );
+    assert!(!files.contains(&"./notes.txt".to_string()), "{files:?}");
+    assert!(files.contains(&"./sub/keep.rs".to_string()), "{files:?}");
+    assert!(!files.contains(&"./sub/local.cfg".to_string()), "{files:?}");
+}
+
+#[test]
+fn include_with_glob_chars_is_literal() {
+    let Some(s) = common::sshd() else { return };
+    let d = tempfile::tempdir().unwrap();
+    let root = repo(d.path());
+    write(&root, "data/[ab].txt", "literal\n");
+    write(&root, "data/a.txt", "sibling\n");
+    run_sync(&s, &root, &["data/[ab].txt"]);
+    let files = remote_files(&s);
+    assert!(files.contains(&"./data/[ab].txt".to_string()), "{files:?}");
+    assert!(!files.contains(&"./data/a.txt".to_string()), "{files:?}");
+}

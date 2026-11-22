@@ -50,11 +50,15 @@ pub struct RsyncSpec<'a> {
     pub includes: &'a [String],
     /// Ancestors of include paths that `.gitignore` ignores; their other contents stay excluded.
     pub ignored_ancestors: &'a [String],
+    /// Paths git reports as ignored (dirs end in `/`). When set, they are fed to rsync on stdin
+    /// as exact excludes, which keeps git's full semantics (`!` negation, nested and global
+    /// ignores). `None` outside a git repo: fall back to rsync's `.gitignore` filter.
+    pub git_ignored: Option<&'a [String]>,
 }
 
 impl RsyncSpec<'_> {
     /// The rsync argv (without the program name). rsync applies the first matching rule, so
-    /// secret excludes come first, then includes, then repo excludes, then `.gitignore`.
+    /// secret excludes come first, then includes, then repo excludes, then git's ignores.
     pub fn args(&self) -> Result<Vec<OsString>, SyncError> {
         check_dest(self.ws, self.workspace_root)?;
         let includes = normalize_includes(self.includes)?;
@@ -70,18 +74,24 @@ impl RsyncSpec<'_> {
         }
         for inc in &includes {
             for anc in ancestors(inc) {
-                a.push(format!("--include=/{anc}/").into());
+                a.push(format!("--include=/{}/", literal(&anc)).into());
             }
-            a.push(format!("--include=/{inc}").into());
-            a.push(format!("--include=/{inc}/***").into());
+            a.push(format!("--include=/{}", literal(inc)).into());
+            a.push(format!("--include=/{}/***", literal(inc)).into());
         }
         for anc in self.ignored_ancestors {
-            a.push(format!("--exclude=/{anc}/*").into());
+            a.push(format!("--exclude=/{}/*", literal(anc)).into());
         }
         for exc in self.excludes {
             a.push(format!("--exclude={exc}").into());
         }
-        a.push("--filter=:- .gitignore".into());
+        match self.git_ignored {
+            Some(_) => {
+                a.push("--from0".into());
+                a.push("--exclude-from=-".into());
+            }
+            None => a.push("--filter=:- .gitignore".into()),
+        }
         let mut src = self.src_root.as_os_str().to_owned();
         src.push("/");
         a.push(src);
@@ -129,6 +139,59 @@ fn normalize_includes(includes: &[String]) -> Result<Vec<String>, SyncError> {
         .collect()
 }
 
+/// Escape a path so rsync matches it literally. rsync honors backslash escapes only in
+/// patterns that contain a wildcard, so plain paths are left as they are.
+fn literal(path: &str) -> String {
+    if !path.contains(['*', '?', '[']) {
+        return path.to_owned();
+    }
+    let mut out = String::with_capacity(path.len() + 4);
+    for c in path.chars() {
+        if matches!(c, '*' | '?' | '[' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// NUL-separated anchored, literal exclude patterns for `--from0 --exclude-from=-`.
+pub fn exclude_list(git_ignored: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in git_ignored {
+        out.push(b'/');
+        out.extend_from_slice(literal(p).as_bytes());
+        out.push(0);
+    }
+    out
+}
+
+/// Untracked paths git ignores, with ignored dirs collapsed (`dir/`). `None` outside git.
+pub fn git_ignored(root: &Path) -> Option<Vec<String>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    Some(
+        out.stdout
+            .split(|&b| b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect(),
+    )
+}
+
 /// `a/b/c` → `["a", "a/b"]`.
 fn ancestors(path: &str) -> Vec<String> {
     let parts: Vec<&str> = path.split('/').collect();
@@ -169,6 +232,7 @@ pub fn sync(
 ) -> Result<(), SyncError> {
     let rsh = t.rsync_rsh();
     let ignored = ignored_ancestors(&tree.root, &r.include)?;
+    let git_list = git_ignored(&tree.root);
     let spec = RsyncSpec {
         src_root: &tree.root,
         rsh: &rsh,
@@ -178,11 +242,22 @@ pub fn sync(
         excludes: &r.exclude,
         includes: &r.include,
         ignored_ancestors: &ignored,
+        git_ignored: git_list.as_deref(),
     };
-    let status = Command::new("rsync")
+    let mut child = Command::new("rsync")
         .args(spec.args()?)
-        .stdin(Stdio::null())
-        .status()?;
+        .stdin(if git_list.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .spawn()?;
+    if let (Some(list), Some(mut stdin)) = (&git_list, child.stdin.take()) {
+        use std::io::Write;
+        // rsync reads the whole list before transferring; a write error surfaces as its exit code.
+        let _ = stdin.write_all(&exclude_list(list));
+    }
+    let status = child.wait()?;
     if status.success() {
         Ok(())
     } else {
@@ -221,6 +296,7 @@ mod tests {
             excludes: exc,
             includes: inc,
             ignored_ancestors: anc,
+            git_ignored: None,
         }
     }
 
@@ -302,6 +378,31 @@ mod tests {
         let inc = s(&["./gen/"]);
         let a = args_of(&spec(&ws, &inc, &[], &[]));
         assert!(a.contains(&"--include=/gen".to_string()), "{a:?}");
+    }
+
+    #[test]
+    fn literal_escapes_glob_chars_only_when_present() {
+        assert_eq!(literal("src/a.rs"), "src/a.rs");
+        assert_eq!(literal("a\\b"), "a\\b");
+        assert_eq!(literal("data/[ab].txt"), "data/\\[ab].txt");
+        assert_eq!(literal("x*y?\\z"), "x\\*y\\?\\\\z");
+    }
+
+    #[test]
+    fn git_ignored_list_replaces_gitignore_filter() {
+        let ws = RemotePath::parse("~/.cache/hopbox/ws/r-1");
+        let ignored = s(&["target/"]);
+        let sp = RsyncSpec {
+            git_ignored: Some(&ignored),
+            ..spec(&ws, &[], &[], &[])
+        };
+        let a = args_of(&sp);
+        assert!(
+            a.contains(&"--exclude-from=-".to_string()) && a.contains(&"--from0".to_string()),
+            "{a:?}"
+        );
+        assert!(!a.iter().any(|x| x.contains(".gitignore")), "{a:?}");
+        assert_eq!(exclude_list(&ignored), b"/target/\0");
     }
 
     #[test]
