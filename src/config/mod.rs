@@ -91,12 +91,12 @@ pub enum ConfigError {
 }
 
 /// `$XDG_CONFIG_HOME/hopbox/config.toml`, else `$HOME/.config/hopbox/config.toml`.
-/// An empty `XDG_CONFIG_HOME` counts as unset, per the XDG spec.
+/// An empty or relative `XDG_CONFIG_HOME` counts as unset, per the XDG spec.
 pub fn global_config_path(
     xdg_config_home: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Option<PathBuf> {
-    let base = match xdg_config_home.filter(|x| !x.is_empty()) {
+    let base = match xdg_config_home.filter(|x| Path::new(x).is_absolute()) {
         Some(xdg) => PathBuf::from(xdg),
         None => PathBuf::from(home.filter(|h| !h.is_empty())?).join(".config"),
     };
@@ -298,6 +298,10 @@ cost = "free"
         );
         assert_eq!(
             p(Some(""), Some("/h")),
+            Some(PathBuf::from("/h/.config/hopbox/config.toml"))
+        );
+        assert_eq!(
+            p(Some("relative/cfg"), Some("/h")),
             Some(PathBuf::from("/h/.config/hopbox/config.toml"))
         );
         assert_eq!(p(None, None), None);
