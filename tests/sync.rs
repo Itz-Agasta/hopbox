@@ -52,7 +52,9 @@ fn run_sync(s: &common::Sshd, root: &Path, include: &[&str]) {
     let ws = remote_workspace(&r.workspace_root, "my_repo-test");
     t.preflight(&ws).unwrap();
     let tree = LocalTree::discover(root).unwrap();
-    sync(&t, &tree, &ws, &r).unwrap();
+    let seen = std::cell::Cell::new(0u32);
+    sync(&t, &tree, &ws, &r, &|pid| seen.set(pid)).unwrap();
+    assert_ne!(seen.get(), 0, "sync must publish the rsync pid");
 }
 
 fn remote_files(s: &common::Sshd) -> Vec<String> {

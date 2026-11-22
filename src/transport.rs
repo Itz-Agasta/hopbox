@@ -13,7 +13,7 @@ use crate::remote_script::{RemotePath, preflight_script, wrap_for_ssh};
 /// Internal hook: an ssh config file passed as `-F`. Used by the integration tests.
 pub const SSH_CONFIG_ENV: &str = "HOPBOX_SSH_CONFIG";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Transport {
     dest: String,
     ssh_config: Option<PathBuf>,
@@ -103,6 +103,16 @@ impl Transport {
     /// Run a script and collect its output. stdin is closed.
     pub fn capture(&self, script: &str) -> Result<Output, TransportError> {
         Ok(self.command(script, false).stdin(Stdio::null()).output()?)
+    }
+
+    /// Start a script with stdin and stdout piped and stderr inherited (the lock holder).
+    pub fn spawn_holder(&self, script: &str) -> Result<Child, TransportError> {
+        Ok(self
+            .command(script, false)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?)
     }
 
     /// Start a script with stdout and stderr piped and stdin inherited.
