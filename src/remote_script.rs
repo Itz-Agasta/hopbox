@@ -125,9 +125,12 @@ impl RunScript<'_> {
             timeout = shell_quote(LOCK_TIMEOUT_LINE),
         );
         if !self.subdir.is_empty() {
-            s += &format!("cd {} && ", shell_quote(self.subdir));
+            // `./` stops a leading `-` being read as an option and keeps CDPATH out of it.
+            s += &format!("cd ./{} && ", shell_quote(self.subdir));
         }
-        s += "exec ";
+        // No `exec`: this shell keeps the lock on fd 9 until the job exits, and the job runs
+        // with fd 9 closed so daemons it leaves behind (sccache, Gradle) never hold the lock.
+        // The script's exit status is the job's, since the job is its last command.
         if let Some(caps) = self.caps {
             s += &format!(
                 "systemd-run --user --scope --quiet --unit {} ",
@@ -149,6 +152,7 @@ impl RunScript<'_> {
             s += " ";
         }
         s += &shell_quote(self.cmd);
+        s += " 9>&-";
         s
     }
 }
@@ -279,8 +283,8 @@ mod tests {
                 r#"cd "$HOME"/.cache/hopbox/ws/martin-1a2b3c4d && touch .hopbox-last-used && exec 9>.hopbox.lock && "#,
                 r#"{ flock -n 9 || { echo 'hopbox: waiting for lock…' >&2; flock -w 30 9 || "#,
                 r#"{ echo 'hopbox: lock wait timed out' >&2; exit 124; }; }; } && "#,
-                r#"exec systemd-run --user --scope --quiet --unit hopbox-deadbeef "#,
-                r#"-p MemoryMax=6G -p MemorySwapMax=0 -p CPUWeight=50 -- bash -lc 'cargo nextest run'"#,
+                r#"systemd-run --user --scope --quiet --unit hopbox-deadbeef "#,
+                r#"-p MemoryMax=6G -p MemorySwapMax=0 -p CPUWeight=50 -- bash -lc 'cargo nextest run' 9>&-"#,
             )
         );
     }
@@ -306,7 +310,7 @@ mod tests {
         let ws = RemotePath::parse("/w");
         let shell = words(&["bash", "-lc"]);
         let s = uncapped(&ws, "", &shell, "cargo test").render();
-        assert!(s.ends_with("&& exec bash -lc 'cargo test'"), "{s}");
+        assert!(s.ends_with("} && bash -lc 'cargo test' 9>&-"), "{s}");
         assert!(!s.contains("systemd-run"), "{s}");
     }
 
@@ -324,7 +328,10 @@ mod tests {
             ..uncapped(&ws, "", &shell, "true")
         }
         .render();
-        assert!(s.contains("--unit hopbox-deadbeef -- bash -lc true"), "{s}");
+        assert!(
+            s.contains("--unit hopbox-deadbeef -- bash -lc true 9>&-"),
+            "{s}"
+        );
         assert!(
             !s.contains("MemoryMax") && !s.contains("MemorySwapMax") && !s.contains("CPUWeight"),
             "{s}"
@@ -346,9 +353,67 @@ mod tests {
         let shell = words(&["sh", "-c"]);
         let s = uncapped(&ws, "crates/my crate", &shell, "true").render();
         assert!(
-            s.contains("} && cd 'crates/my crate' && exec sh -c true"),
+            s.contains("} && cd ./'crates/my crate' && sh -c true 9>&-"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn run_script_dash_subdir_is_not_an_option() {
+        if !have_flock() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("-x")).unwrap();
+        let ws = RemotePath::Abs(dir.path().to_str().unwrap().to_owned());
+        let shell = words(&["sh", "-c"]);
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(wrap_for_ssh(
+                &uncapped(&ws, "-x", &shell, r#"basename "$PWD""#).render(),
+            ))
+            .env("CDPATH", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // CDPATH must not make cd echo a path or pick another dir.
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "-x\n");
+    }
+
+    #[test]
+    fn run_script_job_does_not_inherit_lock() {
+        if !have_flock() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ws = RemotePath::Abs(dir.path().to_str().unwrap().to_owned());
+        let shell = words(&["sh", "-c"]);
+        // The job leaves a daemon behind, like sccache or a Gradle daemon.
+        let cmd = "sleep 30 >/dev/null 2>&1 & echo $! > daemon.pid";
+        let out = run_local(&uncapped(&ws, "", &shell, cmd).render());
+        assert!(out.status.success());
+        let pid = std::fs::read_to_string(dir.path().join("daemon.pid")).unwrap();
+        let _daemon = KillPidOnDrop(pid.trim().to_owned());
+        let free = Command::new("flock")
+            .arg("-n")
+            .arg(dir.path().join(".hopbox.lock"))
+            .arg("true")
+            .status()
+            .unwrap()
+            .success();
+        assert!(free, "a leftover daemon must not hold the workspace lock");
+    }
+
+    struct KillPidOnDrop(String);
+
+    impl Drop for KillPidOnDrop {
+        fn drop(&mut self) {
+            let _ = Command::new("kill").arg(&self.0).status();
+        }
     }
 
     #[test]
