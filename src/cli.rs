@@ -19,6 +19,17 @@ pub enum Command {
         /// Host from the global config (default: `default_host`).
         host: Option<String>,
     },
+    /// Delete remote workspaces that have not been used for a while.
+    Gc {
+        /// Host from the global config (default: `default_host`).
+        host: Option<String>,
+        /// Remove workspaces unused for longer than this (for example 14d, 12h, 2w).
+        #[arg(long, value_name = "AGE", default_value = "14d")]
+        older_than: String,
+        /// List what would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Default, Args)]

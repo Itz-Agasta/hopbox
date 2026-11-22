@@ -265,6 +265,34 @@ pub fn doctor_script(root: &RemotePath, shell: &[String]) -> String {
     )
 }
 
+/// List workspaces: first line `now=<epoch>`, then `<epoch> <name>` per workspace, using the
+/// mtime of `.hopbox-last-used` (else the directory).
+pub fn gc_list_script(root: &RemotePath) -> String {
+    format!(
+        concat!(
+            r#"echo "now=$(date +%s)"; cd {ws} 2>/dev/null || exit 0; "#,
+            r#"for d in */ .[!.]*/; do [ -d "$d" ] || continue; d=${{d%/}}; "#,
+            r#"t=$(stat -c %Y "$d/.hopbox-last-used" 2>/dev/null || stat -c %Y "$d"); "#,
+            r#"echo "$t $d"; done"#,
+        ),
+        ws = root.join("ws").render()
+    )
+}
+
+/// Delete each named workspace unless its lock is held. Prints `removed <name>` or `busy <name>`.
+pub fn gc_delete_script(root: &RemotePath, names: &[String]) -> String {
+    let quoted: Vec<String> = names.iter().map(|n| shell_quote(n).into_owned()).collect();
+    format!(
+        concat!(
+            r#"cd {ws} || exit 0; for n in {names}; do "#,
+            r#"if flock -n "$n/.hopbox.lock" rm -rf -- "$n"; then echo "removed $n"; "#,
+            r#"else echo "busy $n"; fi; done"#,
+        ),
+        ws = root.join("ws").render(),
+        names = quoted.join(" ")
+    )
+}
+
 /// Wrap a script as one `sh -c` command line for ssh.
 pub fn wrap_for_ssh(script: &str) -> String {
     format!("sh -c {}", shell_quote(script))
@@ -522,6 +550,28 @@ mod tests {
         assert!(
             !dir.path().join("not").exists(),
             "doctor must not create the root"
+        );
+    }
+
+    #[test]
+    fn gc_scripts_golden() {
+        let root = RemotePath::parse("~/.cache/hopbox");
+        assert_eq!(
+            gc_list_script(&root),
+            concat!(
+                r#"echo "now=$(date +%s)"; cd "$HOME"/.cache/hopbox/ws 2>/dev/null || exit 0; "#,
+                r#"for d in */ .[!.]*/; do [ -d "$d" ] || continue; d=${d%/}; "#,
+                r#"t=$(stat -c %Y "$d/.hopbox-last-used" 2>/dev/null || stat -c %Y "$d"); "#,
+                r#"echo "$t $d"; done"#,
+            )
+        );
+        assert_eq!(
+            gc_delete_script(&root, &["old-1".into(), "my repo-2".into()]),
+            concat!(
+                r#"cd "$HOME"/.cache/hopbox/ws || exit 0; for n in old-1 'my repo-2'; do "#,
+                r#"if flock -n "$n/.hopbox.lock" rm -rf -- "$n"; then echo "removed $n"; "#,
+                r#"else echo "busy $n"; fi; done"#,
+            )
         );
     }
 
