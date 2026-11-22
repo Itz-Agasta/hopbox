@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+mod resolve;
+pub use resolve::{DEFAULT_SHELL, DEFAULT_WORKSPACE_ROOT, Resolved, RunFlags, resolve};
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct GlobalConfig {
@@ -79,11 +82,11 @@ pub enum ConfigError {
     InvalidMem(String),
     #[error("cpu_weight {0} out of range 1..=10000")]
     InvalidCpuWeight(u16),
-    #[error("unknown host {name:?}")]
+    #[error("unknown host {name:?}; configured hosts: {}", if known.is_empty() { "none".to_owned() } else { known.join(", ") })]
     UnknownHost { name: String, known: Vec<String> },
-    #[error("no host selected")]
+    #[error("no host selected: pass --host NAME or set default_host in the global config")]
     NoHost,
-    #[error("shell is empty")]
+    #[error("shell is empty: set shell to a command such as \"bash -lc\"")]
     EmptyShell,
 }
 
