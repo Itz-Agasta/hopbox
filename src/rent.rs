@@ -73,8 +73,24 @@ fn load(state_dir: &Path) -> Result<Vec<Instance>, Failure> {
 
 /// Longest TTL `up` accepts.
 pub const MAX_TTL: Duration = Duration::from_secs(30 * 86_400);
-/// A state lock older than this belongs to a crashed hopbox and is broken.
+/// A state lock without an owner pid older than this is from a hopbox that crashed while
+/// taking it, and is broken.
 const STALE_LOCK: Duration = Duration::from_secs(60);
+
+/// Whether a lock dir belongs to a dead process. Uses the owner pid when recorded
+/// (`kill -0`, which works on Linux and macOS), else the lock's age.
+fn lock_is_stale(lock: &Path) -> bool {
+    match std::fs::read_to_string(lock.join("pid")) {
+        Ok(pid) if !pid.trim().is_empty() => !std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success()),
+        _ => std::fs::metadata(lock)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().unwrap_or_default() > STALE_LOCK),
+    }
+}
 
 /// Load, change and save the state file under a lock (a directory: `mkdir` is atomic), so
 /// two hopbox processes never drop each other's records.
@@ -88,13 +104,13 @@ pub fn with_state<T>(
     let mut tries = 0;
     loop {
         match std::fs::create_dir(&lock) {
-            Ok(()) => break,
+            Ok(()) => {
+                let _ = std::fs::write(lock.join("pid"), std::process::id().to_string());
+                break;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&lock)
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|t| t.elapsed().unwrap_or_default() > STALE_LOCK);
-                if stale {
-                    let _ = std::fs::remove_dir(&lock);
+                if lock_is_stale(&lock) {
+                    let _ = std::fs::remove_dir_all(&lock);
                     continue;
                 }
                 tries += 1;
@@ -115,7 +131,7 @@ pub fn with_state<T>(
         state::save(&state::path(state_dir), &list).map_err(failed)?;
         Ok(out)
     })();
-    let _ = std::fs::remove_dir(&lock);
+    let _ = std::fs::remove_dir_all(&lock);
     result
 }
 
@@ -267,8 +283,9 @@ pub fn up<C: Cli>(
     inst.ssh_host = host;
     inst.ssh_port = port;
     with_state(state_dir, |list| {
-        if let Some(slot) = list.iter_mut().find(|i| i.id == id) {
-            *slot = inst.clone();
+        match list.iter_mut().find(|i| i.id == id) {
+            Some(slot) => *slot = inst.clone(),
+            None => list.push(inst.clone()),
         }
         Ok(())
     })?;
@@ -335,32 +352,44 @@ pub fn ls<C: Cli>(
     state_dir: &Path,
     now: u64,
 ) -> Result<(Vec<String>, Vec<Row>), Failure> {
+    // No provider calls happen under the state lock: decide from a snapshot, act, then
+    // remove only the ids confirmed gone, so records added meanwhile are never touched.
     let mut live = v.list().map_err(|e| failed(e.to_string()))?;
+    let known = load(state_dir)?;
     let mut notes = Vec::new();
-    let keep = with_state(state_dir, |known| {
-        let mut keep = Vec::new();
-        for i in known.drain(..) {
-            let on_vast = live
-                .iter()
-                .position(|l| l.id == i.id && l.hopbox_name() == Some(i.name.as_str()));
-            match on_vast {
-                Some(pos) if now >= i.deadline => match v.destroy(i.id) {
-                    Ok(()) => {
-                        live.remove(pos);
-                        notes.push(format!("destroyed {}: past its deadline", i.name));
-                    }
-                    Err(e) => {
-                        notes.push(format!("cannot destroy expired {}: {e}", i.name));
-                        keep.push(i);
-                    }
-                },
-                Some(_) => keep.push(i),
-                None => notes.push(format!("removed {}: no longer on vast", i.name)),
-            }
+    let mut gone: Vec<u64> = Vec::new();
+    for i in &known {
+        let on_vast = live
+            .iter()
+            .position(|l| l.id == i.id && l.hopbox_name() == Some(i.name.as_str()));
+        match on_vast {
+            Some(pos) if now >= i.deadline => match v.destroy(i.id) {
+                Ok(()) => {
+                    live.remove(pos);
+                    gone.push(i.id);
+                    notes.push(format!("destroyed {}: past its deadline", i.name));
+                }
+                Err(e) => notes.push(format!("cannot destroy expired {}: {e}", i.name)),
+            },
+            Some(_) => {}
+            // Missing from the snapshot: confirm before forgetting (it may be brand new).
+            None => match v.show(i.id) {
+                Ok(Some(info)) if info.hopbox_name() == Some(i.name.as_str()) => {}
+                Ok(_) => {
+                    gone.push(i.id);
+                    notes.push(format!("removed {}: no longer on vast", i.name));
+                }
+                Err(e) => notes.push(format!("cannot check {}: {e}", i.name)),
+            },
         }
-        known.clone_from(&keep);
-        Ok(keep)
-    })?;
+    }
+    if !gone.is_empty() {
+        with_state(state_dir, |list| {
+            list.retain(|i| !gone.contains(&i.id));
+            Ok(())
+        })?;
+    }
+    let keep = known;
     let rows = live
         .iter()
         .map(|l: &InstanceInfo| {
@@ -760,6 +789,38 @@ mod tests {
     }
 
     #[test]
+    fn ls_rechecks_before_forgetting() {
+        // A record missing from the list snapshot (a concurrent `up`) is kept if show finds it.
+        let d = tempfile::tempdir().unwrap();
+        recorded(d.path(), "new", 777, 4_000_000_000);
+        let v = Vast {
+            cli: FakeCli::with(&[
+                (0, &fixture("instances.json")),
+                (
+                    0,
+                    r#"{"id": 777, "actual_status": "loading", "label": "hopbox-new", "dph_total": 0.4}"#,
+                ),
+            ]),
+        };
+        let (notes, _) = ls(&v, d.path(), 1_700_000_200).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(state::load(&state::path(d.path())).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lock_of_a_dead_process_is_broken_even_when_fresh() {
+        let d = tempfile::tempdir().unwrap();
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let pid = dead.id();
+        dead.wait().unwrap();
+        let lock = d.path().join("instances.lock");
+        std::fs::create_dir(&lock).unwrap();
+        std::fs::write(lock.join("pid"), pid.to_string()).unwrap();
+        assert_eq!(with_state(d.path(), |l| Ok(l.len())).unwrap(), 0);
+        assert!(!lock.exists());
+    }
+
+    #[test]
     fn down_checks_label() {
         let d = tempfile::tempdir().unwrap();
         recorded(d.path(), "gpu1", 424242, 4_000_000_000);
@@ -802,6 +863,7 @@ mod tests {
             cli: FakeCli::with(&[
                 (0, &fixture("instances.json")),
                 (0, "destroying instance 31337."),
+                (0, r#"{"instances": null}"#),
             ]),
         };
         let (notes, rows) = ls(&v, d.path(), 1_700_000_200).unwrap();
