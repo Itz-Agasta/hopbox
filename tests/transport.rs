@@ -48,3 +48,33 @@ fn unreachable_host_is_reported() {
         other => panic!("expected Unreachable, got {other:?}"),
     }
 }
+
+/// Paths with spaces (a control dir, a known_hosts file) must reach ssh as one value each.
+#[test]
+fn paths_with_spaces_work() {
+    let Some(s) = common::sshd() else { return };
+    let known = s.dir.path().join("k h").join("known_hosts");
+    std::fs::create_dir_all(known.parent().unwrap()).unwrap();
+    let t = Transport::with_config(s.host, Some(s.ssh_config.clone()), s.dir.path().join("c m"))
+        .unwrap()
+        .with_options(
+            None,
+            &[
+                "StrictHostKeyChecking=accept-new".to_owned(),
+                hopbox::transport::ssh_path_option("UserKnownHostsFile", &known),
+            ],
+        );
+    let out = t.capture("echo ok").unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ok\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let k = std::fs::read_to_string(&known).unwrap_or_default();
+    assert!(
+        k.contains("127.0.0.1"),
+        "host key must land in {}",
+        known.display()
+    );
+}

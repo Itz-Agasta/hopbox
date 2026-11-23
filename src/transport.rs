@@ -32,6 +32,12 @@ pub enum TransportError {
     Preflight { dest: String, stderr: String },
 }
 
+/// `Key="<path>"` for `ssh -o`: ssh splits unquoted values on whitespace, so a path with a
+/// space would become several values (or an error).
+pub fn ssh_path_option(key: &str, path: &std::path::Path) -> String {
+    format!("{key}=\"{}\"", path.display())
+}
+
 /// A `--port` forward: local `127.0.0.1:<local>` to the remote's `localhost:<remote>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortSpec {
@@ -123,8 +129,8 @@ impl Transport {
             args.push("-F".into());
             args.push(cfg.into());
         }
-        let mut control_path = OsString::from("ControlPath=");
-        control_path.push(self.control_dir.join("%C"));
+        let control_path =
+            OsString::from(ssh_path_option("ControlPath", &self.control_dir.join("%C")));
         for opt in [
             OsString::from("ControlMaster=auto"),
             control_path,
@@ -339,7 +345,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let t = Transport::with_config("h", None, d.path().join("cm")).unwrap();
         let args = strings(t.base_args());
-        let cp = format!("ControlPath={}/%C", d.path().join("cm").display());
+        let cp = format!("ControlPath=\"{}/%C\"", d.path().join("cm").display());
         let want = [
             "-o",
             "ControlMaster=auto",

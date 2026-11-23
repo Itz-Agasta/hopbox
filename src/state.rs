@@ -77,9 +77,9 @@ pub fn merge_hosts(global: &mut GlobalConfig, instances: &[Instance], state_dir:
                 ssh_port: Some(i.ssh_port),
                 ssh_options: vec![
                     "StrictHostKeyChecking=accept-new".to_owned(),
-                    format!(
-                        "UserKnownHostsFile={}",
-                        state_dir.join("known_hosts").display()
+                    crate::transport::ssh_path_option(
+                        "UserKnownHostsFile",
+                        &state_dir.join("known_hosts"),
                     ),
                 ],
                 cost: Some(format!("${:.2}/h", i.dph)),
@@ -137,7 +137,7 @@ mod tests {
             gpu.ssh_options,
             [
                 "StrictHostKeyChecking=accept-new",
-                "UserKnownHostsFile=/s/known_hosts"
+                "UserKnownHostsFile=\"/s/known_hosts\""
             ]
         );
         assert!(gpu.memory_max.is_none());
