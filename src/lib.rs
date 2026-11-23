@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod doctor;
 pub mod exit;
 pub mod quote;
 pub mod remote_script;

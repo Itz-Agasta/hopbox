@@ -14,6 +14,11 @@ pub struct Cli {
 pub enum Command {
     /// Sync the repo, run a command on the remote, and stream the result.
     Run(RunArgs),
+    /// Check that a host has what hopbox needs. Never installs anything.
+    Doctor {
+        /// Host from the global config (default: `default_host`).
+        host: Option<String>,
+    },
 }
 
 #[derive(Debug, Default, Args)]
@@ -94,7 +99,9 @@ mod tests {
             "--nocapture",
         ])
         .unwrap();
-        let Command::Run(r) = cli.command;
+        let Command::Run(r) = cli.command else {
+            panic!("expected run")
+        };
         assert_eq!(r.host.as_deref(), Some("h"));
         assert_eq!(r.mem.as_deref(), Some("2G"));
         assert_eq!(r.include, ["a", "b"]);

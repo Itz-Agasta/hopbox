@@ -242,6 +242,29 @@ pub fn preflight_script(ws: &RemotePath) -> String {
     )
 }
 
+/// Print what `hopbox doctor` checks as `key=value` lines. Creates nothing on the remote.
+pub fn doctor_script(root: &RemotePath, shell: &[String]) -> String {
+    let shell_cmd: Vec<String> = shell.iter().map(|w| shell_quote(w).into_owned()).collect();
+    format!(
+        concat!(
+            "echo \"arch=$(uname -m)\"; ",
+            "echo \"rsync=$(rsync --version 2>/dev/null | head -n 1)\"; ",
+            "echo \"bash=$(command -v bash)\"; ",
+            "echo \"flock=$(flock --version 2>/dev/null | head -n 1)\"; ",
+            "if systemd-run --user --scope --quiet true >/dev/null 2>&1; ",
+            "then echo caps=1; else echo caps=0; fi; ",
+            "echo \"mem=$(awk '/^MemAvailable:/{{a=$2}} /^MemTotal:/{{t=$2}} END{{print a, t}}' ",
+            "/proc/meminfo 2>/dev/null)\"; ",
+            // The workspace root may not exist yet: measure its nearest existing ancestor.
+            "d={root}; while [ ! -d \"$d\" ]; do d=$(dirname \"$d\"); done; ",
+            "echo \"disk=$(df -Pk \"$d\" | awk 'NR==2{{print $4}}')\"; ",
+            "echo \"path=$({shell} 'printf %s \"$PATH\"' </dev/null 2>/dev/null)\"",
+        ),
+        root = root.render(),
+        shell = shell_cmd.join(" "),
+    )
+}
+
 /// Wrap a script as one `sh -c` command line for ssh.
 pub fn wrap_for_ssh(script: &str) -> String {
     format!("sh -c {}", shell_quote(script))
@@ -477,6 +500,28 @@ mod tests {
         assert_eq!(
             env_write_script(&ws, ".hopbox-env-deadbeef"),
             "cd /w && umask 077 && cat > .hopbox-env-deadbeef"
+        );
+    }
+
+    #[test]
+    fn doctor_script_runs_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = RemotePath::Abs(dir.path().join("not/yet").to_str().unwrap().to_owned());
+        let out = run_local(&doctor_script(&root, &words(&["sh", "-c"])));
+        let text = String::from_utf8(out.stdout).unwrap();
+        for key in [
+            "arch=", "rsync=", "bash=", "flock=", "caps=", "mem=", "disk=", "path=",
+        ] {
+            assert!(
+                text.lines().any(|l| l.starts_with(key)),
+                "missing {key} in {text}"
+            );
+        }
+        let disk = text.lines().find_map(|l| l.strip_prefix("disk=")).unwrap();
+        assert!(disk.parse::<u64>().is_ok(), "disk={disk}");
+        assert!(
+            !dir.path().join("not").exists(),
+            "doctor must not create the root"
         );
     }
 
