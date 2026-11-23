@@ -115,9 +115,19 @@ impl<C: Cli> Vast<C> {
         if let Some(max) = q.max_price {
             filters += &format!(" dph_total<={max}");
         }
+        // `--storage`: price the offer with the disk we will rent (vast defaults to 5 GB).
         let out = self.call(
             "search offers",
-            args(&["search", "offers", &filters, "-o", "dlperf_usd-", "--raw"]),
+            vec![
+                "search".into(),
+                "offers".into(),
+                filters,
+                "--storage".into(),
+                q.disk.to_string(),
+                "-o".into(),
+                "dlperf_usd-".into(),
+                "--raw".into(),
+            ],
         )?;
         let offers: Vec<Offer> = Self::json("search offers", &out)?;
         // Re-check the price: never trust a filter alone with money.
@@ -166,7 +176,8 @@ impl<C: Cli> Vast<C> {
         }
     }
 
-    pub fn show(&self, id: u64) -> Result<InstanceInfo, VastError> {
+    /// The instance, or `None` when vast says it no longer exists.
+    pub fn show(&self, id: u64) -> Result<Option<InstanceInfo>, VastError> {
         let out = self.call(
             "show instance",
             vec![
@@ -176,7 +187,16 @@ impl<C: Cli> Vast<C> {
                 "--raw".into(),
             ],
         )?;
-        Self::json("show instance", &out)
+        let v: serde_json::Value = Self::json("show instance", &out)?;
+        if v.get("instances").is_some_and(serde_json::Value::is_null) {
+            return Ok(None);
+        }
+        serde_json::from_value(v)
+            .map(Some)
+            .map_err(|e| VastError::Parse {
+                cmd: "show instance".into(),
+                msg: e.to_string(),
+            })
     }
 
     /// Instances whose label starts with `hopbox-`.
@@ -198,8 +218,9 @@ impl<C: Cli> Vast<C> {
         })
     }
 
+    /// vastai exits 0 even when the API refuses, so success is its confirmation line.
     pub fn destroy(&self, id: u64) -> Result<(), VastError> {
-        self.call(
+        let out = self.call(
             "destroy instance",
             vec![
                 "destroy".into(),
@@ -207,8 +228,15 @@ impl<C: Cli> Vast<C> {
                 id.to_string(),
                 "-y".into(),
             ],
-        )
-        .map(|_| ())
+        )?;
+        if out.contains(&format!("destroying instance {id}.")) {
+            Ok(())
+        } else {
+            Err(VastError::Failed {
+                cmd: "destroy instance".into(),
+                msg: out.trim().to_owned(),
+            })
+        }
     }
 }
 
@@ -315,7 +343,10 @@ pub mod tests {
             call[2],
             "verified=true rentable=true direct_port_count>=1 reliability>0.98 gpu_name=RTX_4090 disk_space>=30 dph_total<=0.6"
         );
-        assert_eq!(&call[3..], ["-o", "dlperf_usd-", "--raw"]);
+        assert_eq!(
+            &call[3..],
+            ["--storage", "30", "-o", "dlperf_usd-", "--raw"]
+        );
     }
 
     #[test]
@@ -396,6 +427,32 @@ pub mod tests {
         );
         assert_eq!(parse_ssh_url("root@1.2.3.4:22"), None);
         assert_eq!(parse_ssh_url("ssh://root@host"), None);
+    }
+
+    #[test]
+    fn destroy_checks_the_confirmation_not_just_the_exit_code() {
+        // vastai prints the API error and still exits 0.
+        let v = Vast {
+            cli: FakeCli::with(&[(0, "Instance not found\n"), (0, "destroying instance 7.\n")]),
+        };
+        let e = v.destroy(7).unwrap_err().to_string();
+        assert!(e.contains("Instance not found"), "{e}");
+        v.destroy(7).unwrap();
+    }
+
+    #[test]
+    fn show_of_a_gone_instance_is_none() {
+        let v = Vast {
+            cli: FakeCli::with(&[
+                (0, r#"{"instances": null}"#),
+                (0, &fixture("show-running.json")),
+            ]),
+        };
+        assert_eq!(v.show(1).unwrap(), None);
+        assert_eq!(
+            v.show(31337).unwrap().unwrap().label.as_deref(),
+            Some("hopbox-gpu1")
+        );
     }
 
     #[test]

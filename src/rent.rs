@@ -67,12 +67,56 @@ fn random_name() -> String {
     format!("vast-{:02x}{:02x}", b[0], b[1])
 }
 
-fn save(state_dir: &Path, list: &[Instance]) -> Result<(), Failure> {
-    state::save(&state::path(state_dir), list).map_err(failed)
-}
-
 fn load(state_dir: &Path) -> Result<Vec<Instance>, Failure> {
     state::load(&state::path(state_dir)).map_err(failed)
+}
+
+/// Longest TTL `up` accepts.
+pub const MAX_TTL: Duration = Duration::from_secs(30 * 86_400);
+/// A state lock older than this belongs to a crashed hopbox and is broken.
+const STALE_LOCK: Duration = Duration::from_secs(60);
+
+/// Load, change and save the state file under a lock (a directory: `mkdir` is atomic), so
+/// two hopbox processes never drop each other's records.
+pub fn with_state<T>(
+    state_dir: &Path,
+    f: impl FnOnce(&mut Vec<Instance>) -> Result<T, Failure>,
+) -> Result<T, Failure> {
+    std::fs::create_dir_all(state_dir)
+        .map_err(|e| failed(format!("{}: {e}", state_dir.display())))?;
+    let lock = state_dir.join("instances.lock");
+    let mut tries = 0;
+    loop {
+        match std::fs::create_dir(&lock) {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&lock)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().unwrap_or_default() > STALE_LOCK);
+                if stale {
+                    let _ = std::fs::remove_dir(&lock);
+                    continue;
+                }
+                tries += 1;
+                if tries > 200 {
+                    return Err(failed(format!(
+                        "{} is held by another hopbox; try again",
+                        lock.display()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(failed(format!("{}: {e}", lock.display()))),
+        }
+    }
+    let result = (|| {
+        let mut list = load(state_dir)?;
+        let out = f(&mut list)?;
+        state::save(&state::path(state_dir), &list).map_err(failed)?;
+        Ok(out)
+    })();
+    let _ = std::fs::remove_dir(&lock);
+    result
 }
 
 /// Rent an instance, wait until ssh works, and record it as a host.
@@ -94,11 +138,10 @@ pub fn up<C: Cli>(
         )));
     }
     let ttl = parse_age(&a.ttl).map_err(usage)?;
-    if ttl.is_zero() {
-        return Err(usage("--ttl must be more than zero"));
+    if ttl.is_zero() || ttl > MAX_TTL {
+        return Err(usage("--ttl must be more than zero and at most 30d"));
     }
-    let mut known = load(state_dir)?;
-    if known.iter().any(|i| i.name == name) {
+    if load(state_dir)?.iter().any(|i| i.name == name) {
         return Err(usage(format!("an instance named {name} already exists")));
     }
     let offers = v
@@ -142,7 +185,9 @@ pub fn up<C: Cli>(
         }
     }
 
-    let deadline = (d.now)() + ttl.as_secs();
+    let deadline = (d.now)()
+        .checked_add(ttl.as_secs())
+        .ok_or_else(|| usage("--ttl is too large"))?;
     let id = v
         .create(
             offer.id,
@@ -165,15 +210,31 @@ pub fn up<C: Cli>(
         deadline,
         dph: offer.dph_total,
     };
-    known.push(inst.clone());
-    save(state_dir, &known)?;
+    let recorded = with_state(state_dir, |list| {
+        if list.iter().any(|i| i.name == name) {
+            return Err(usage(format!(
+                "another hopbox just rented an instance named {name}"
+            )));
+        }
+        list.push(inst.clone());
+        Ok(())
+    });
+    if let Err((code, msg)) = recorded {
+        return Err(match v.destroy(id) {
+            Ok(()) => (code, format!("{msg}; destroyed instance {id}")),
+            Err(e) => (
+                code,
+                format!("{msg}; destroying instance {id} also failed: {e}"),
+            ),
+        });
+    }
 
     let abandon = |why: String| -> Failure {
-        let destroyed = v.destroy(id);
-        let mut list = load(state_dir).unwrap_or_default();
-        if destroyed.is_ok() {
-            list.retain(|i| i.id != id);
-            let _ = save(state_dir, &list);
+        if v.destroy(id).is_ok() {
+            let _ = with_state(state_dir, |list| {
+                list.retain(|i| i.id != id);
+                Ok(())
+            });
             failed(format!("{why}; destroyed instance {id}"))
         } else {
             failed(format!(
@@ -184,7 +245,10 @@ pub fn up<C: Cli>(
 
     let mut polls = 0;
     loop {
-        let info = v.show(id).map_err(|e| abandon(e.to_string()))?;
+        let info = v
+            .show(id)
+            .map_err(|e| abandon(e.to_string()))?
+            .ok_or_else(|| abandon(format!("instance {id} disappeared")))?;
         match info.actual_status.as_deref() {
             Some("running") => break,
             Some(s @ ("exited" | "unknown" | "offline")) => {
@@ -202,11 +266,12 @@ pub fn up<C: Cli>(
     inst.ssh_user = user;
     inst.ssh_host = host;
     inst.ssh_port = port;
-    let mut list = load(state_dir)?;
-    if let Some(slot) = list.iter_mut().find(|i| i.id == id) {
-        *slot = inst.clone();
-    }
-    save(state_dir, &list)?;
+    with_state(state_dir, |list| {
+        if let Some(slot) = list.iter_mut().find(|i| i.id == id) {
+            *slot = inst.clone();
+        }
+        Ok(())
+    })?;
     if !(d.ssh_ready)(&inst) {
         return Err(abandon(format!("ssh to instance {id} never worked")));
     }
@@ -215,7 +280,7 @@ pub fn up<C: Cli>(
 
 /// Destroy `name`, after checking the instance still carries its `hopbox-<name>` label.
 pub fn down<C: Cli>(v: &Vast<C>, name: &str, state_dir: &Path) -> Result<String, Failure> {
-    let mut list = load(state_dir)?;
+    let list = load(state_dir)?;
     let id = match list.iter().find(|i| i.name == name) {
         Some(i) => i.id,
         None => v
@@ -226,7 +291,16 @@ pub fn down<C: Cli>(v: &Vast<C>, name: &str, state_dir: &Path) -> Result<String,
             .map(|i| i.id)
             .ok_or_else(|| usage(format!("no instance named {name}")))?,
     };
-    let info = v.show(id).map_err(|e| failed(e.to_string()))?;
+    let forget = |id: u64| {
+        with_state(state_dir, |list| {
+            list.retain(|i| i.id != id);
+            Ok(())
+        })
+    };
+    let Some(info) = v.show(id).map_err(|e| failed(e.to_string()))? else {
+        forget(id)?;
+        return Ok(format!("{name} was already gone"));
+    };
     let want = format!("{LABEL_PREFIX}{name}");
     if info.label.as_deref() != Some(want.as_str()) {
         return Err(failed(format!(
@@ -235,8 +309,7 @@ pub fn down<C: Cli>(v: &Vast<C>, name: &str, state_dir: &Path) -> Result<String,
         )));
     }
     v.destroy(id).map_err(|e| failed(e.to_string()))?;
-    list.retain(|i| i.id != id);
-    save(state_dir, &list)?;
+    forget(id)?;
     Ok(format!("destroyed {name}"))
 }
 
@@ -263,29 +336,31 @@ pub fn ls<C: Cli>(
     now: u64,
 ) -> Result<(Vec<String>, Vec<Row>), Failure> {
     let mut live = v.list().map_err(|e| failed(e.to_string()))?;
-    let mut known = load(state_dir)?;
     let mut notes = Vec::new();
-    let mut keep = Vec::new();
-    for i in known.drain(..) {
-        let on_vast = live
-            .iter()
-            .position(|l| l.id == i.id && l.hopbox_name() == Some(i.name.as_str()));
-        match on_vast {
-            Some(pos) if now >= i.deadline => match v.destroy(i.id) {
-                Ok(()) => {
-                    live.remove(pos);
-                    notes.push(format!("destroyed {}: past its deadline", i.name));
-                }
-                Err(e) => {
-                    notes.push(format!("cannot destroy expired {}: {e}", i.name));
-                    keep.push(i);
-                }
-            },
-            Some(_) => keep.push(i),
-            None => notes.push(format!("removed {}: no longer on vast", i.name)),
+    let keep = with_state(state_dir, |known| {
+        let mut keep = Vec::new();
+        for i in known.drain(..) {
+            let on_vast = live
+                .iter()
+                .position(|l| l.id == i.id && l.hopbox_name() == Some(i.name.as_str()));
+            match on_vast {
+                Some(pos) if now >= i.deadline => match v.destroy(i.id) {
+                    Ok(()) => {
+                        live.remove(pos);
+                        notes.push(format!("destroyed {}: past its deadline", i.name));
+                    }
+                    Err(e) => {
+                        notes.push(format!("cannot destroy expired {}: {e}", i.name));
+                        keep.push(i);
+                    }
+                },
+                Some(_) => keep.push(i),
+                None => notes.push(format!("removed {}: no longer on vast", i.name)),
+            }
         }
-    }
-    save(state_dir, &keep)?;
+        known.clone_from(&keep);
+        Ok(keep)
+    })?;
     let rows = live
         .iter()
         .map(|l: &InstanceInfo| {
@@ -543,7 +618,7 @@ mod tests {
                 (0, &fixture("search-4090.json")),
                 (0, &fixture("create.json")),
                 (0, &fixture("show-exited.json")),
-                (0, ""),
+                (0, "destroying instance 31337."),
             ]),
         };
         let err = up(&v, &args(), d.path(), &deps(&|_| Some(true), &|_| true)).unwrap_err();
@@ -572,7 +647,7 @@ mod tests {
                 (0, &loading),
                 (0, &loading),
                 (0, &loading),
-                (0, ""),
+                (0, "destroying instance 31337."),
             ]),
         };
         let err = up(&v, &args(), d.path(), &deps(&|_| Some(true), &|_| true)).unwrap_err();
@@ -596,6 +671,95 @@ mod tests {
     }
 
     #[test]
+    fn up_rejects_huge_ttl_before_anything() {
+        let d = tempfile::tempdir().unwrap();
+        let v = Vast {
+            cli: FakeCli::with(&[]),
+        };
+        let a = UpArgs {
+            ttl: "100000000000w".into(),
+            yes_spend: true,
+            ..args()
+        };
+        assert_eq!(
+            up(&v, &a, d.path(), &deps(&|_| Some(true), &|_| true))
+                .unwrap_err()
+                .0,
+            exit::USAGE
+        );
+        let a = UpArgs {
+            ttl: "31d".into(),
+            yes_spend: true,
+            ..args()
+        };
+        assert_eq!(
+            up(&v, &a, d.path(), &deps(&|_| Some(true), &|_| true))
+                .unwrap_err()
+                .0,
+            exit::USAGE
+        );
+        assert!(v.cli.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn up_destroys_when_state_cannot_be_saved() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        state::save(&state::path(d.path()), &[]).unwrap();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(d.path().join("probe"), "").is_ok() {
+            return; // root: permissions do not stop writes
+        }
+        let v = Vast {
+            cli: FakeCli::with(&[
+                (0, &fixture("search-4090.json")),
+                (0, &fixture("create.json")),
+                (0, "destroying instance 31337."),
+            ]),
+        };
+        let a = UpArgs {
+            yes_spend: true,
+            ..args()
+        };
+        let err = up(&v, &a, d.path(), &deps(&|_| Some(true), &|_| true)).unwrap_err();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(err.1.contains("destroyed instance 31337"), "{}", err.1);
+        assert_eq!(
+            v.cli.calls.borrow().last().unwrap(),
+            &["destroy", "instance", "31337", "-y"]
+        );
+    }
+
+    #[test]
+    fn down_of_a_gone_instance_forgets_it() {
+        let d = tempfile::tempdir().unwrap();
+        recorded(d.path(), "gpu1", 31337, 4_000_000_000);
+        let v = Vast {
+            cli: FakeCli::with(&[(0, r#"{"instances": null}"#)]),
+        };
+        assert_eq!(down(&v, "gpu1", d.path()).unwrap(), "gpu1 was already gone");
+        assert!(state::load(&state::path(d.path())).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_state_lock_is_broken() {
+        let d = tempfile::tempdir().unwrap();
+        let lock = d.path().join("instances.lock");
+        std::fs::create_dir(&lock).unwrap();
+        assert!(
+            std::process::Command::new("touch")
+                .args(["-d", "5 minutes ago"])
+                .arg(&lock)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let n = with_state(d.path(), |list| Ok(list.len())).unwrap();
+        assert_eq!(n, 0);
+        assert!(!lock.exists(), "lock released");
+    }
+
+    #[test]
     fn down_checks_label() {
         let d = tempfile::tempdir().unwrap();
         recorded(d.path(), "gpu1", 424242, 4_000_000_000);
@@ -616,7 +780,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         recorded(d.path(), "gpu1", 31337, 4_000_000_000);
         let v = Vast {
-            cli: FakeCli::with(&[(0, &fixture("show-running.json")), (0, "")]),
+            cli: FakeCli::with(&[
+                (0, &fixture("show-running.json")),
+                (0, "destroying instance 31337."),
+            ]),
         };
         assert_eq!(down(&v, "gpu1", d.path()).unwrap(), "destroyed gpu1");
         assert_eq!(
@@ -632,7 +799,10 @@ mod tests {
         recorded(d.path(), "gpu1", 31337, 1_700_000_100); // expired at now=1_700_000_200
         recorded(d.path(), "gone", 999, 4_000_000_000); // not on vast anymore
         let v = Vast {
-            cli: FakeCli::with(&[(0, &fixture("instances.json")), (0, "")]),
+            cli: FakeCli::with(&[
+                (0, &fixture("instances.json")),
+                (0, "destroying instance 31337."),
+            ]),
         };
         let (notes, rows) = ls(&v, d.path(), 1_700_000_200).unwrap();
         assert_eq!(
