@@ -282,7 +282,10 @@ pub fn up<C: Cli>(
         }
         polls += 1;
         if polls >= d.max_polls {
-            return Err(abandon(format!("instance {id} did not start in time")));
+            return Err(abandon(format!(
+                "instance {id} did not start in time (last status: {})",
+                info.actual_status.as_deref().unwrap_or("none")
+            )));
         }
         (d.sleep)(d.poll);
     }
@@ -487,7 +490,8 @@ pub fn execute_up(a: &UpArgs, state_dir: &Path) -> i32 {
         confirm: &ask,
         ssh_ready: &ssh_ready,
         poll: Duration::from_secs(5),
-        max_polls: 120,
+        // 20 minutes: large images (the default PyTorch one) can take over 10 to pull.
+        max_polls: 240,
     };
     report(up(&vast(), a, state_dir, &deps).map(|i| {
         println!(
@@ -688,7 +692,12 @@ mod tests {
             ]),
         };
         let err = up(&v, &args(), d.path(), &deps(&|_| Some(true), &|_| true)).unwrap_err();
-        assert!(err.1.contains("did not start in time"), "{}", err.1);
+        assert!(
+            err.1
+                .contains("did not start in time (last status: loading)"),
+            "{}",
+            err.1
+        );
         assert!(state::load(&state::path(d.path())).unwrap().is_empty());
     }
 
