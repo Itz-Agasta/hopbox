@@ -417,8 +417,16 @@ pub fn jobs_list_script(root: &RemotePath) -> String {
 pub fn job_logs_script(root: &RemotePath, id: &str, follow: bool) -> String {
     let mut s = job_dir_cd(root, id);
     if follow {
-        // `--retry`: right after `run --bg` the wrapper may not have created `log` yet.
-        s += r#"if [ -f exit ]; then cat log; else tail --retry -n +1 -f --pid="$(cat pid)" log 2>/dev/null; fi"#;
+        // Follow while the job's own process (checked by identity, not bare pid) is alive,
+        // then give tail a second to print the last lines. `--retry`: right after
+        // `run --bg` the wrapper may not have created `log` yet.
+        s += ALIVE_FN;
+        s += concat!(
+            r#"if [ -f exit ] || ! alive .; then cat log 2>/dev/null; exit 0; fi; "#,
+            r#"tail --retry -n +1 -f log 2>/dev/null & t=$!; "#,
+            r#"while [ ! -e exit ] && alive .; do sleep 1; done; sleep 1; "#,
+            r#"kill $t 2>/dev/null; wait $t 2>/dev/null; exit 0"#,
+        );
     } else {
         s += "cat log";
     }
@@ -1142,11 +1150,17 @@ mod tests {
     }
 
     #[test]
-    fn logs_follow_waits_for_log() {
+    fn logs_follow_ends_for_lost_job_with_reused_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_other, jd) = reused_pid_job(dir.path());
+        std::fs::write(jd.join("log"), "partial\n").unwrap();
+        let t = std::time::Instant::now();
+        let out = run_local(&job_logs_script(&gc_root(dir.path()), "0a1b2c3d", true));
         assert!(
-            job_logs_script(&RemotePath::parse("/r"), "0a1b2c3d", true)
-                .contains("tail --retry -n +1 -f")
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "must not follow a reused pid"
         );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "partial\n");
     }
 
     fn hold_lock(lock: &Path) -> KillOnDrop {
