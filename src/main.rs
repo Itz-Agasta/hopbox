@@ -8,6 +8,7 @@ use hopbox::config::global_config_path;
 use hopbox::doctor;
 use hopbox::exit;
 use hopbox::gc;
+use hopbox::jobs;
 use hopbox::run::{self, DEFAULT_LOCK_WAIT_SECS, LOCK_WAIT_ENV};
 use hopbox::status::Status;
 
@@ -54,6 +55,21 @@ fn main() -> ExitCode {
                 ExitCode::from(exit::USAGE)
             }
         },
+        Command::Jobs { host, json } => with_env(|env| jobs::list(host.as_deref(), json, env)),
+        Command::Logs { id, follow, host } => {
+            with_env(|env| jobs::logs(&id, host.as_deref(), follow, env))
+        }
+        Command::Kill { id, host } => with_env(|env| jobs::kill(&id, host.as_deref(), env)),
+        Command::Wait { id, host, json } => {
+            let status = match env() {
+                Ok(env) => jobs::wait(&id, host.as_deref(), &env),
+                Err(e) => {
+                    Status::hopbox_error(exit::USAGE.into(), "-", Duration::ZERO, format!("{e:#}"))
+                }
+            };
+            print_status(if json { status.json() } else { status.line() });
+            ExitCode::from(u8::try_from(status.exit).unwrap_or(1))
+        }
         Command::Doctor { host } => match env() {
             Ok(env) => {
                 ExitCode::from(u8::try_from(doctor::execute(host.as_deref(), &env)).unwrap_or(1))
@@ -63,6 +79,17 @@ fn main() -> ExitCode {
                 ExitCode::from(exit::USAGE)
             }
         },
+    }
+}
+
+/// Run a subcommand that needs the process env and returns an exit code.
+fn with_env(f: impl FnOnce(&run::Env) -> i32) -> ExitCode {
+    match env() {
+        Ok(env) => ExitCode::from(u8::try_from(f(&env)).unwrap_or(1)),
+        Err(e) => {
+            eprintln!("hopbox: {e:#}");
+            ExitCode::from(exit::USAGE)
+        }
     }
 }
 

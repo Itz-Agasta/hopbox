@@ -190,7 +190,9 @@ impl BgStart<'_> {
             "IFS= read -r go && [ \"$go\" = go ] && mkdir -p {jobs} && mkdir {jd} && \
              {{ printf '%s\\n' {meta}; echo \"start=$(date +%s)\"; }} > {jd}/meta && \
              {{ setsid nohup sh -c {wrapper} </dev/null >/dev/null 2>&1 & \
-             echo $! > {jd}/pid && echo {BG_STARTED_LINE}; }}",
+             echo $! > {jd}/pid && \
+             echo \"$(cat /proc/sys/kernel/random/boot_id) $(awk '{{print $22}}' /proc/$!/stat)\" \
+             > {jd}/ident && echo {BG_STARTED_LINE}; }}",
             jobs = self.jobs.render(),
             meta = meta.join(" "),
             wrapper = shell_quote(self.wrapper),
@@ -372,6 +374,111 @@ pub fn gc_delete_script(root: &RemotePath, names: &[String], cutoff: u64) -> Str
         locks = locks,
         names = quoted.join(" "),
         cutoff = cutoff,
+    )
+}
+
+/// Exit code of the job scripts below when `<root>/jobs/<id>` does not exist.
+pub const NO_JOB_EXIT: i32 = 66;
+
+/// Shell function `alive DIR`: true only when the job's recorded pid is still the same
+/// process (same boot, same start time), so a reused pid is never mistaken for the job.
+const ALIVE_FN: &str = concat!(
+    r#"alive() { s=$(awk '{print $22}' "/proc/$(cat "$1/pid" 2>/dev/null)/stat" 2>/dev/null); "#,
+    r#"[ -n "$s" ] && [ "$(cat "$1/ident" 2>/dev/null)" = "$(cat /proc/sys/kernel/random/boot_id) $s" ]; }; "#,
+);
+
+fn job_dir_cd(root: &RemotePath, id: &str) -> String {
+    format!(
+        "cd {} 2>/dev/null || exit {NO_JOB_EXIT}; ",
+        root.join("jobs").join(id).render()
+    )
+}
+
+/// One line `now=<epoch>`, then per job `<id>\t<state>\t<exit or ->\t<start>\t<cmd>`, where
+/// state is `done` (exit file), `running` (pid alive) or `lost`.
+pub fn jobs_list_script(root: &RemotePath) -> String {
+    format!(
+        concat!(
+            "{alive}",
+            r#"echo "now=$(date +%s)"; cd {jobs} 2>/dev/null || exit 0; "#,
+            r#"for d in */; do id=${{d%/}}; [ -f "$id/meta" ] || continue; "#,
+            r#"if [ -f "$id/exit" ]; then st=done; ex=$(cat "$id/exit"); "#,
+            r#"elif alive "$id"; then st=running; ex=-; "#,
+            r#"else st=lost; ex=-; fi; "#,
+            r#"printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$st" "$ex" "$(sed -n 's/^start=//p' "$id/meta")" "#,
+            r#""$(sed -n 's/^cmd=//p' "$id/meta")"; done"#,
+        ),
+        jobs = root.join("jobs").render(),
+        alive = ALIVE_FN,
+    )
+}
+
+/// Print the job's log; with `follow`, keep printing until the job ends.
+pub fn job_logs_script(root: &RemotePath, id: &str, follow: bool) -> String {
+    let mut s = job_dir_cd(root, id);
+    if follow {
+        // Follow while the job's own process (checked by identity, not bare pid) is alive,
+        // then give tail a second to print the last lines. `--retry`: right after
+        // `run --bg` the wrapper may not have created `log` yet.
+        s += ALIVE_FN;
+        s += concat!(
+            r#"if [ -f exit ] || ! alive .; then cat log 2>/dev/null; exit 0; fi; "#,
+            r#"tail --retry -n +1 -f log 2>/dev/null & t=$!; "#,
+            r#"while [ ! -e exit ] && alive .; do sleep 1; done; sleep 1; "#,
+            r#"kill $t 2>/dev/null; wait $t 2>/dev/null; exit 0"#,
+        );
+    } else {
+        s += "cat log";
+    }
+    s
+}
+
+/// Wait for the job to end. Prints its exit code (plus a line `oom` when the memory cap
+/// killed it), or `lost` when the wrapper died without writing one.
+pub fn job_wait_script(root: &RemotePath, id: &str) -> String {
+    job_dir_cd(root, id)
+        + ALIVE_FN
+        + concat!(
+            r#"while [ ! -e exit ]; do alive . || break; sleep 1; done; "#,
+            r#"if [ -e exit ]; then cat exit; if [ -e oom ]; then echo oom; fi; else echo lost; fi"#,
+        )
+}
+
+/// Stop the job: its scope when capped, and its whole process group (no `--`: dash's kill
+/// rejects it). Prints `done` when the job had already finished and `lost` when its process
+/// is gone; a reused pid is never signalled.
+pub fn job_kill_script(root: &RemotePath, id: &str) -> String {
+    let scope = shell_quote(&format!("hopbox-{id}.scope")).into_owned();
+    job_dir_cd(root, id)
+        + ALIVE_FN
+        + &format!(
+            concat!(
+                r#"if [ -e exit ]; then echo done; exit 0; fi; "#,
+                r#"if ! alive .; then echo lost; exit 0; fi; "#,
+                r#"systemctl --user stop {scope} 2>/dev/null; "#,
+                r#"kill -TERM -"$(cat pid)" 2>/dev/null; true"#,
+            ),
+            scope = scope
+        )
+}
+
+/// Remove finished job dirs whose exit file is older than `cutoff` (remote epoch seconds).
+/// Prints `job <id>` per match (`failed job <id>` and exit 1 when rm fails); deletes only
+/// when `delete` is true.
+pub fn gc_jobs_script(root: &RemotePath, cutoff: u64, delete: bool) -> String {
+    format!(
+        concat!(
+            r#"cd {jobs} 2>/dev/null || exit 0; rc=0; for d in */; do id=${{d%/}}; "#,
+            r#"[ -f "$id/exit" ] || continue; t=$(stat -c %Y -- "$id/exit") || continue; "#,
+            r#"[ "$t" -le {cutoff} ] || continue; {act}; done; exit $rc"#,
+        ),
+        jobs = root.join("jobs").render(),
+        cutoff = cutoff,
+        act = if delete {
+            r#"if rm -rf -- "$id"; then echo "job $id"; else echo "failed job $id"; rc=1; fi"#
+        } else {
+            r#"echo "job $id""#
+        },
     )
 }
 
@@ -876,7 +983,9 @@ mod tests {
                 r#"echo locked && IFS= read -r go && [ "$go" = go ] && mkdir -p /r/jobs && "#,
                 r#"mkdir /r/jobs/0a1b2c3d && { printf '%s\n' 'cmd=echo hi'; echo "start=$(date +%s)"; } "#,
                 r#"> /r/jobs/0a1b2c3d/meta && { setsid nohup sh -c 'echo '\''job'\''' "#,
-                r#"</dev/null >/dev/null 2>&1 & echo $! > /r/jobs/0a1b2c3d/pid && echo started; }"#,
+                r#"</dev/null >/dev/null 2>&1 & echo $! > /r/jobs/0a1b2c3d/pid && "#,
+                r#"echo "$(cat /proc/sys/kernel/random/boot_id) $(awk '{print $22}' /proc/$!/stat)" "#,
+                r#"> /r/jobs/0a1b2c3d/ident && echo started; }"#,
             )),
             "{s}"
         );
@@ -960,6 +1069,98 @@ mod tests {
         let read = |f: &str| std::fs::read_to_string(dir.path().join("j").join(f)).unwrap();
         assert_eq!(read("exit"), "5\n");
         assert_eq!(read("log"), "out\nerr\n");
+    }
+
+    #[test]
+    fn gc_jobs_reports_rm_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("jobs/0a1b2c3d/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.path().join("jobs/0a1b2c3d/exit"), "0\n").unwrap();
+        std::fs::write(sub.join("f"), "").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::remove_file(sub.join("f")).is_ok() {
+            return; // root: permissions do not stop rm
+        }
+        let out = run_local(&gc_jobs_script(&gc_root(dir.path()), 4_000_000_000, true));
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "failed job 0a1b2c3d\n"
+        );
+        assert!(!out.status.success());
+    }
+
+    /// A job dir whose pid points at a live process that is not the job.
+    fn reused_pid_job(dir: &Path) -> (KillOnDrop, std::path::PathBuf) {
+        let other = KillOnDrop(Command::new("sleep").arg("30").spawn().unwrap());
+        let jd = dir.join("jobs/0a1b2c3d");
+        std::fs::create_dir_all(&jd).unwrap();
+        std::fs::write(jd.join("pid"), format!("{}\n", other.0.id())).unwrap();
+        std::fs::write(jd.join("ident"), "some-other-boot 12345\n").unwrap();
+        std::fs::write(jd.join("meta"), "cmd=x\nstart=1\n").unwrap();
+        (other, jd)
+    }
+
+    #[test]
+    fn kill_never_signals_a_reused_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut other, _) = reused_pid_job(dir.path());
+        let out = run_local(&job_kill_script(&gc_root(dir.path()), "0a1b2c3d"));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "lost\n");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            other.0.try_wait().unwrap().is_none(),
+            "unrelated process was signalled"
+        );
+    }
+
+    #[test]
+    fn reused_pid_is_lost_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_other, _) = reused_pid_job(dir.path());
+        let out = run_local(&jobs_list_script(&gc_root(dir.path())));
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("0a1b2c3d\tlost\t-"), "{text}");
+        let out = run_local(&job_wait_script(&gc_root(dir.path()), "0a1b2c3d"));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "lost\n");
+    }
+
+    #[test]
+    fn live_job_is_running_and_killable() {
+        if !have_flock() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = bg_wrapper_script(
+            &gc_root(dir.path()).join("jobs").join("0a1b2c3d"),
+            "exec sleep 30",
+            None,
+        );
+        let out = run_bg_tail(dir.path(), "0a1b2c3d", &wrapper);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "locked\nstarted\n");
+        let list = run_local(&jobs_list_script(&gc_root(dir.path())));
+        let text = String::from_utf8_lossy(&list.stdout);
+        assert!(text.contains("0a1b2c3d\trunning\t-"), "{text}");
+        let out = run_local(&job_kill_script(&gc_root(dir.path()), "0a1b2c3d"));
+        assert!(out.status.success());
+        let wait = run_local(&job_wait_script(&gc_root(dir.path()), "0a1b2c3d"));
+        assert_eq!(String::from_utf8_lossy(&wait.stdout), "143\n");
+    }
+
+    #[test]
+    fn logs_follow_ends_for_lost_job_with_reused_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_other, jd) = reused_pid_job(dir.path());
+        std::fs::write(jd.join("log"), "partial\n").unwrap();
+        let t = std::time::Instant::now();
+        let out = run_local(&job_logs_script(&gc_root(dir.path()), "0a1b2c3d", true));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "must not follow a reused pid"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "partial\n");
     }
 
     fn hold_lock(lock: &Path) -> KillOnDrop {
