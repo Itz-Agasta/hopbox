@@ -7,6 +7,10 @@ description: Offload heavy commands to a remote machine with hopbox. Use when a 
 
 `hopbox run` copies the current repo to a remote host, runs one command there, streams the output back, and exits with the command's exit code. Your edits stay local; each run re-syncs only what changed.
 
+## Before the first run
+
+hopbox must be installed and have a host in `~/.config/hopbox/config.toml`. If `hopbox` is missing or `hopbox doctor` fails, tell the user what's missing instead of running the job locally.
+
 ## Choose where to run
 
 **Offload**: full test suites, release builds, first builds of large projects, Playwright and e2e runs, `docker` and `kubectl` work, anything expected to need more than ~3 GB of RAM, and anything the user asks to run remotely.

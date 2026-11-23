@@ -4,12 +4,20 @@ hopbox lets a coding agent such as Claude Code offload heavy jobs and read the r
 
 ## Install the skill
 
-Copy the skill folder into your agent's skills directory. For Claude Code:
+Install it with the `skills` CLI, which supports Claude Code, Codex, Cursor, and other agents. `-g` makes it available in every project:
 
 ```sh
-mkdir -p ~/.claude/skills
-cp -r skills/hopbox ~/.claude/skills/
+npx skills add Itz-Agasta/hopbox --skill hopbox -g
 ```
+
+In Claude Code, you can install it as a plugin instead:
+
+```sh
+claude plugin marketplace add Itz-Agasta/hopbox
+claude plugin install hopbox@hopbox
+```
+
+To install it by hand, copy `skills/hopbox` into your agent's skills directory, such as `~/.claude/skills/`.
 
 ## What the agent runs
 

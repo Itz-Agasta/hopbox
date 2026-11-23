@@ -1,0 +1,17 @@
+{
+  "name": "hopbox",
+  "owner": {
+    "name": "Itz-Agasta",
+    "url": "https://github.com/Itz-Agasta"
+  },
+  "metadata": {
+    "description": "hopbox: offload heavy builds and tests from your coding agent to a remote machine over SSH."
+  },
+  "plugins": [
+    {
+      "name": "hopbox",
+      "source": "./",
+      "description": "Teaches your agent when to offload heavy builds and tests to a remote machine with hopbox, and how to read the result."
+    }
+  ]
+}
