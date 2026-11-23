@@ -60,6 +60,16 @@ fn main() -> ExitCode {
             with_env(|env| jobs::logs(&id, host.as_deref(), follow, env))
         }
         Command::Up(a) => with_env(|env| {
+            let taken = match &env.global_config {
+                Some(p) => match hopbox::config::load_global(p) {
+                    Ok(g) => g.hosts.into_keys().collect(),
+                    Err(e) => {
+                        eprintln!("hopbox: {e}");
+                        return i32::from(exit::USAGE);
+                    }
+                },
+                None => Vec::new(),
+            };
             hopbox::rent::execute_up(
                 &hopbox::rent::UpArgs {
                     gpu: a.gpu.clone(),
@@ -69,6 +79,7 @@ fn main() -> ExitCode {
                     disk: a.disk,
                     image: a.image.clone(),
                     yes_spend: a.yes_spend,
+                    taken,
                 },
                 &env.state_dir,
             )

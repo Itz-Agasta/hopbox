@@ -88,3 +88,39 @@ fn down_unknown_name_125() {
     let o = hopbox(d.path(), &["down", "nope"]);
     assert_eq!(o.status.code(), Some(125));
 }
+
+#[test]
+fn up_refuses_a_configured_host_name() {
+    let d = tempfile::tempdir().unwrap();
+    fake_vastai(d.path());
+    std::fs::create_dir_all(d.path().join("cfg/hopbox")).unwrap();
+    std::fs::write(
+        d.path().join("cfg/hopbox/config.toml"),
+        "[hosts.hermes]\nssh = \"hermes\"\n",
+    )
+    .unwrap();
+    let o = hopbox(
+        d.path(),
+        &[
+            "up",
+            "vast",
+            "--gpu",
+            "RTX_4090",
+            "--ttl",
+            "1h",
+            "--name",
+            "hermes",
+            "--yes-spend",
+        ],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(125),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        !d.path().join("calls.log").exists(),
+        "nothing called for a clashing name"
+    );
+}

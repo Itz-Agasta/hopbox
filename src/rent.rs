@@ -42,6 +42,8 @@ pub struct UpArgs {
     pub disk: u32,
     pub image: String,
     pub yes_spend: bool,
+    /// Host names from `[hosts]`; a rented name must not shadow one.
+    pub taken: Vec<String>,
 }
 
 /// Side effects `up` needs, injectable for tests.
@@ -84,6 +86,11 @@ pub fn up<C: Cli>(
     if !valid_name(&name) {
         return Err(usage(format!(
             "invalid name {name:?}: use 1-32 lowercase letters, digits and '-'"
+        )));
+    }
+    if a.taken.contains(&name) {
+        return Err(usage(format!(
+            "{name} is already a host in your config; pick another --name"
         )));
     }
     let ttl = parse_age(&a.ttl).map_err(usage)?;
@@ -437,6 +444,7 @@ mod tests {
             disk: 30,
             image: "img".into(),
             yes_spend: false,
+            taken: vec![],
         }
     }
 
