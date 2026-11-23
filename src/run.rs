@@ -21,7 +21,7 @@ use crate::remote_script::{
 };
 use crate::status::{Source, Status};
 use crate::sync::{SyncError, relative_path, sync};
-use crate::transport::{Transport, TransportError};
+use crate::transport::{PortSpec, Transport, TransportError};
 use crate::workspace::{LocalTree, local_hostname, remote_workspace, workspace_name};
 
 /// Internal hook: lock wait in seconds. Used by the integration tests.
@@ -79,9 +79,16 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     let r = config::resolve(&global, &repo, &flags).map_err(usage)?;
     *host = r.host_name.clone();
     let cmd = command_for(args, &r)?;
-    if args.bg && (!args.fetch.is_empty() || args.tail.is_some()) {
-        return Err(usage("--bg cannot be combined with --fetch or --tail"));
+    if args.bg && (!args.fetch.is_empty() || args.tail.is_some() || !args.port.is_empty()) {
+        return Err(usage(
+            "--bg cannot be combined with --fetch, --tail or --port",
+        ));
     }
+    let ports = args
+        .port
+        .iter()
+        .map(|p| PortSpec::parse(p).map_err(usage))
+        .collect::<Result<Vec<_>, _>>()?;
     if args.bg && !r.fetch.is_empty() {
         eprintln!(
             "hopbox: warning: fetch paths from .hopbox.toml are not copied back for --bg jobs"
@@ -157,6 +164,9 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         },
         &interrupt,
     )?;
+
+    // Forwards live only for this run; the guard cancels them on every return path.
+    let _forwards = Forwards::open(&t, &ports)?;
 
     if !args.no_sync {
         let synced = sync(&t, &tree, &ws, &r, &|pid| track_pid(pid, &interrupt));
@@ -320,6 +330,35 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     }
     holder.release();
     Ok(result)
+}
+
+/// `--port` forwards on the ControlMaster, cancelled when dropped.
+struct Forwards<'a> {
+    t: &'a Transport,
+    open: Vec<PortSpec>,
+}
+
+impl<'a> Forwards<'a> {
+    fn open(t: &'a Transport, ports: &[PortSpec]) -> Result<Forwards<'a>, Failure> {
+        let mut f = Forwards {
+            t,
+            open: Vec::new(),
+        };
+        for &p in ports {
+            // On error `f` drops here and cancels the forwards already open.
+            t.forward(p).map_err(usage)?;
+            f.open.push(p);
+        }
+        Ok(f)
+    }
+}
+
+impl Drop for Forwards<'_> {
+    fn drop(&mut self) {
+        for &p in &self.open {
+            self.t.cancel(p);
+        }
+    }
 }
 
 /// The lock-holder ssh session. Closing its stdin releases the lock.

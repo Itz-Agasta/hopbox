@@ -28,6 +28,40 @@ pub enum TransportError {
     Unreachable { dest: String, stderr: String },
     #[error("preflight on {dest} failed: {stderr}")]
     Preflight { dest: String, stderr: String },
+    #[error("cannot forward port {local}: {stderr}")]
+    Forward { local: u16, stderr: String },
+}
+
+/// A `--port` forward: local `127.0.0.1:<local>` to the remote's `localhost:<remote>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortSpec {
+    pub local: u16,
+    pub remote: u16,
+}
+
+impl PortSpec {
+    /// `3000` or `LOCAL:REMOTE`, each 1-65535.
+    pub fn parse(s: &str) -> Result<PortSpec, String> {
+        let bad = || format!("invalid port {s:?}: use PORT or LOCAL:REMOTE (1-65535)");
+        let port = |p: &str| p.parse::<u16>().ok().filter(|&n| n != 0).ok_or_else(bad);
+        match s.split_once(':') {
+            Some((l, r)) => Ok(PortSpec {
+                local: port(l)?,
+                remote: port(r)?,
+            }),
+            None => {
+                let p = port(s)?;
+                Ok(PortSpec {
+                    local: p,
+                    remote: p,
+                })
+            }
+        }
+    }
+
+    fn arg(&self) -> String {
+        format!("127.0.0.1:{}:localhost:{}", self.local, self.remote)
+    }
 }
 
 /// What the preflight learned about the remote.
@@ -161,6 +195,33 @@ impl Transport {
         rsh
     }
 
+    /// Add a local forward to the running ControlMaster (`ssh -O forward`).
+    pub fn forward(&self, p: PortSpec) -> Result<(), TransportError> {
+        let out = self.control("forward", p)?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(TransportError::Forward {
+                local: p.local,
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            })
+        }
+    }
+
+    /// Remove a forward added by [`Transport::forward`]. Best effort.
+    pub fn cancel(&self, p: PortSpec) {
+        let _ = self.control("cancel", p);
+    }
+
+    fn control(&self, op: &str, p: PortSpec) -> Result<Output, TransportError> {
+        Ok(Command::new("ssh")
+            .args(self.base_args())
+            .args(["-O", op, "-L", &p.arg(), "--"])
+            .arg(&self.dest)
+            .stdin(Stdio::null())
+            .output()?)
+    }
+
     /// Open the connection, create the workspace, and probe for resource caps.
     pub fn preflight(&self, ws: &RemotePath) -> Result<Preflight, TransportError> {
         let out = self.capture(&preflight_script(ws))?;
@@ -205,6 +266,34 @@ fn default_control_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn port_spec_parse() {
+        assert_eq!(
+            PortSpec::parse("3000"),
+            Ok(PortSpec {
+                local: 3000,
+                remote: 3000
+            })
+        );
+        assert_eq!(
+            PortSpec::parse("8080:3000"),
+            Ok(PortSpec {
+                local: 8080,
+                remote: 3000
+            })
+        );
+        for bad in ["", "0", "70000", "a", "1:", ":1", "1:2:3", "-1"] {
+            assert!(PortSpec::parse(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            PortSpec {
+                local: 8080,
+                remote: 3000
+            }
+            .arg(),
+            "127.0.0.1:8080:localhost:3000"
+        );
+    }
     use super::*;
 
     fn strings(args: Vec<OsString>) -> Vec<String> {
