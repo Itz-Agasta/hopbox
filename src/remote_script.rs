@@ -126,20 +126,27 @@ pub const LOCKED_LINE: &str = "locked";
 
 /// Takes the workspace lock and holds it until its stdin closes. hopbox runs it in its own
 /// ssh session before syncing, so sync, job and fetch all happen under one lock, and nothing
-/// the job starts ever holds the lock fd.
+/// the job starts ever holds the lock fd. The lock file lives in `locks`, outside the
+/// workspace, so `gc` can delete a workspace without unlinking a lock someone else may take.
 #[derive(Debug)]
 pub struct LockScript<'a> {
     pub workspace: &'a RemotePath,
+    /// `<workspace_root>/locks`; the lock file is `<locks>/<name>.lock`.
+    pub locks: &'a RemotePath,
+    pub name: &'a str,
     pub wait_secs: u64,
 }
 
 impl LockScript<'_> {
     pub fn render(&self) -> String {
         format!(
-            "cd {ws} && touch .hopbox-last-used && exec 9>.hopbox.lock && \
+            "mkdir -p {locks} && exec 9>{lock} && \
              {{ flock -n 9 || {{ echo {wait} >&2; flock -w {secs} 9 || \
              {{ echo {timeout} >&2; exit 124; }}; }}; }} && \
+             mkdir -p {ws} && cd {ws} && touch .hopbox-last-used && \
              echo {locked} && exec cat >/dev/null",
+            locks = self.locks.render(),
+            lock = self.locks.join(&format!("{}.lock", self.name)).render(),
             ws = self.workspace.render(),
             wait = shell_quote(LOCK_WAIT_LINE),
             secs = self.wait_secs,
@@ -262,6 +269,43 @@ pub fn doctor_script(root: &RemotePath, shell: &[String]) -> String {
         ),
         root = root.render(),
         shell = shell_cmd.join(" "),
+    )
+}
+
+/// List workspaces: first line `now=<epoch>`, then `<epoch> <name>` per workspace, using the
+/// mtime of `.hopbox-last-used` (else the directory).
+pub fn gc_list_script(root: &RemotePath) -> String {
+    format!(
+        concat!(
+            r#"echo "now=$(date +%s)"; cd {ws} 2>/dev/null || exit 0; "#,
+            r#"for d in */ .[!.]*/ ..?*/; do [ -d "$d" ] || continue; d=${{d%/}}; "#,
+            r#"t=$(stat -c %Y -- "$d/.hopbox-last-used" 2>/dev/null || stat -c %Y -- "$d"); "#,
+            r#"echo "$t $d"; done"#,
+        ),
+        ws = root.join("ws").render()
+    )
+}
+
+/// Delete each named workspace while holding its lock, unless it was used after `cutoff`
+/// (remote epoch seconds). Prints one line per name: `removed`, `busy`, `fresh` or
+/// `failed <name> <rc>`. Lock files are never deleted.
+pub fn gc_delete_script(root: &RemotePath, names: &[String], cutoff: u64) -> String {
+    let quoted: Vec<String> = names.iter().map(|n| shell_quote(n).into_owned()).collect();
+    let locks = root.join("locks").render();
+    format!(
+        concat!(
+            r#"cd {ws} || exit 0; mkdir -p {locks} || exit 1; "#,
+            r#"for n in {names}; do ( exec 8>{locks}/"$n.lock" && "#,
+            r#"{{ flock -n 8 || exit 75; }} && "#,
+            r#"t=$(stat -c %Y -- "$n/.hopbox-last-used" 2>/dev/null || stat -c %Y -- "$n") && "#,
+            r#"{{ [ "$t" -le {cutoff} ] || exit 76; }} && rm -rf -- "$n" ); rc=$?; "#,
+            r#"case $rc in 0) echo "removed $n";; 75) echo "busy $n";; 76) echo "fresh $n";; "#,
+            r#"*) echo "failed $n $rc";; esac; done"#,
+        ),
+        ws = root.join("ws").render(),
+        locks = locks,
+        names = quoted.join(" "),
+        cutoff = cutoff,
     )
 }
 
@@ -526,6 +570,132 @@ mod tests {
     }
 
     #[test]
+    fn gc_scripts_golden() {
+        let root = RemotePath::parse("~/.cache/hopbox");
+        assert_eq!(
+            gc_list_script(&root),
+            concat!(
+                r#"echo "now=$(date +%s)"; cd "$HOME"/.cache/hopbox/ws 2>/dev/null || exit 0; "#,
+                r#"for d in */ .[!.]*/ ..?*/; do [ -d "$d" ] || continue; d=${d%/}; "#,
+                r#"t=$(stat -c %Y -- "$d/.hopbox-last-used" 2>/dev/null || stat -c %Y -- "$d"); "#,
+                r#"echo "$t $d"; done"#,
+            )
+        );
+        assert_eq!(
+            gc_delete_script(&root, &["old-1".into(), "my repo-2".into()], 1000),
+            concat!(
+                r#"cd "$HOME"/.cache/hopbox/ws || exit 0; mkdir -p "$HOME"/.cache/hopbox/locks || exit 1; "#,
+                r#"for n in old-1 'my repo-2'; do ( exec 8>"$HOME"/.cache/hopbox/locks/"$n.lock" && "#,
+                r#"{ flock -n 8 || exit 75; } && "#,
+                r#"t=$(stat -c %Y -- "$n/.hopbox-last-used" 2>/dev/null || stat -c %Y -- "$n") && "#,
+                r#"{ [ "$t" -le 1000 ] || exit 76; } && rm -rf -- "$n" ); rc=$?; "#,
+                r#"case $rc in 0) echo "removed $n";; 75) echo "busy $n";; 76) echo "fresh $n";; "#,
+                r#"*) echo "failed $n $rc";; esac; done"#,
+            )
+        );
+    }
+
+    #[test]
+    fn gc_list_sees_every_name() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["a", ".b", "..c", "-d"] {
+            std::fs::create_dir_all(dir.path().join("ws").join(n)).unwrap();
+        }
+        let out = run_local(&gc_list_script(&gc_root(dir.path())));
+        let mut names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .skip(1)
+            .map(|l| l.split_once(' ').unwrap().1.to_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["-d", "..c", ".b", "a"]);
+    }
+
+    #[test]
+    fn gc_delete_handles_dash_names() {
+        if !have_flock() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ws/-d")).unwrap();
+        let out = run_local(&gc_delete_script(
+            &gc_root(dir.path()),
+            &["-d".into()],
+            4_000_000_000,
+        ));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "removed -d\n");
+    }
+
+    fn gc_root(dir: &Path) -> RemotePath {
+        RemotePath::Abs(dir.to_str().unwrap().to_owned())
+    }
+
+    #[test]
+    fn gc_delete_keeps_workspace_used_since_listing() {
+        if !have_flock() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ws/a")).unwrap();
+        std::fs::write(dir.path().join("ws/a/.hopbox-last-used"), "").unwrap();
+        // Cutoff far in the past: the workspace was used after it.
+        let out = run_local(&gc_delete_script(&gc_root(dir.path()), &["a".into()], 1));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "fresh a\n");
+        assert!(dir.path().join("ws/a").exists());
+    }
+
+    #[test]
+    fn gc_delete_reports_busy_and_keeps_lock_file() {
+        if !have_flock() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ws/a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("locks")).unwrap();
+        let holder = hold_lock(&dir.path().join("locks/a.lock"));
+        let out = run_local(&gc_delete_script(
+            &gc_root(dir.path()),
+            &["a".into()],
+            4_000_000_000,
+        ));
+        drop(holder);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "busy a\n");
+        assert!(dir.path().join("ws/a").exists());
+        let out = run_local(&gc_delete_script(
+            &gc_root(dir.path()),
+            &["a".into()],
+            4_000_000_000,
+        ));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "removed a\n");
+        assert!(!dir.path().join("ws/a").exists());
+        assert!(
+            dir.path().join("locks/a.lock").exists(),
+            "lock file must stay"
+        );
+    }
+
+    #[test]
+    fn gc_delete_reports_rm_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("ws/a/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("f"), "").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::remove_file(sub.join("f")).is_ok() || !have_flock() {
+            return; // running as root: permissions do not stop rm
+        }
+        let out = run_local(&gc_delete_script(
+            &gc_root(dir.path()),
+            &["a".into()],
+            4_000_000_000,
+        ));
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.starts_with("failed a "), "{stdout}");
+    }
+
+    #[test]
     fn wrap_for_ssh_quotes_whole_script() {
         assert_eq!(wrap_for_ssh("echo x"), "sh -c 'echo x'");
     }
@@ -590,16 +760,30 @@ mod tests {
         assert_eq!(
             LockScript {
                 workspace: &ws,
+                locks: &RemotePath::parse("/l"),
+                name: "my repo-1",
                 wait_secs: 30
             }
             .render(),
             concat!(
-                "cd /w && touch .hopbox-last-used && exec 9>.hopbox.lock && ",
+                "mkdir -p /l && exec 9>'/l/my repo-1.lock' && ",
                 "{ flock -n 9 || { echo 'hopbox: waiting for lock…' >&2; flock -w 30 9 || ",
                 "{ echo 'hopbox: lock wait timed out' >&2; exit 124; }; }; } && ",
+                "mkdir -p /w && cd /w && touch .hopbox-last-used && ",
                 "echo locked && exec cat >/dev/null",
             )
         );
+    }
+
+    /// `<dir>/ws/w` workspace and `<dir>/locks/w.lock`, created as a run would.
+    fn lock_layout(dir: &Path) -> (RemotePath, RemotePath, std::path::PathBuf) {
+        std::fs::create_dir_all(dir.join("locks")).unwrap();
+        let root = RemotePath::Abs(dir.to_str().unwrap().to_owned());
+        (
+            root.join("ws").join("w"),
+            root.join("locks"),
+            dir.join("locks/w.lock"),
+        )
     }
 
     fn hold_lock(lock: &Path) -> KillOnDrop {
@@ -635,13 +819,15 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let holder = hold_lock(&dir.path().join(".hopbox.lock"));
-        let ws = RemotePath::Abs(dir.path().to_str().unwrap().to_owned());
+        let (ws, locks, lock) = lock_layout(dir.path());
+        let holder = hold_lock(&lock);
         let out = Command::new("sh")
             .arg("-c")
             .arg(wrap_for_ssh(
                 &LockScript {
                     workspace: &ws,
+                    locks: &locks,
+                    name: "w",
                     wait_secs: 0,
                 }
                 .render(),
@@ -666,13 +852,14 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let lock = dir.path().join(".hopbox.lock");
-        let ws = RemotePath::Abs(dir.path().to_str().unwrap().to_owned());
+        let (ws, locks, lock) = lock_layout(dir.path());
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(wrap_for_ssh(
                 &LockScript {
                     workspace: &ws,
+                    locks: &locks,
+                    name: "w",
                     wait_secs: 5,
                 }
                 .render(),
@@ -686,7 +873,7 @@ mod tests {
             .read_line(&mut line)
             .unwrap();
         assert_eq!(line, format!("{LOCKED_LINE}\n"));
-        assert!(dir.path().join(".hopbox-last-used").exists());
+        assert!(dir.path().join("ws/w/.hopbox-last-used").exists());
         assert!(!lock_free(&lock), "lock must be held while stdin is open");
         drop(child.stdin.take());
         assert!(child.wait().unwrap().success());

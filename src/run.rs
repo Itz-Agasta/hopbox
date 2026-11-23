@@ -91,10 +91,9 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     let env_file_body = env_file_contents(&args.env, &repo.env)?;
 
     let t = Transport::new(&r.ssh_dest).map_err(usage)?;
-    let ws = remote_workspace(
-        &r.workspace_root,
-        &workspace_name(&tree.root, &local_hostname()),
-    );
+    let ws_name = workspace_name(&tree.root, &local_hostname());
+    let ws = remote_workspace(&r.workspace_root, &ws_name);
+    let locks = RemotePath::parse(&r.workspace_root).join("locks");
     let pre = t.preflight(&ws).map_err(|e| match e {
         TransportError::Unreachable { .. } => (exit::CONNECT.into(), e.to_string()),
         _ => usage(e),
@@ -109,7 +108,7 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     let interrupt = install_interrupt(&t, caps.as_ref().map(|c| c.unit.clone()));
 
     // One lock for sync, job and fetch, so a second run can't change files under this one.
-    let holder = acquire_lock(&t, &ws, env.lock_wait_secs, &interrupt)?;
+    let holder = acquire_lock(&t, &ws, &locks, &ws_name, env.lock_wait_secs, &interrupt)?;
 
     if !args.no_sync {
         let synced = sync(&t, &tree, &ws, &r, &|pid| track_pid(pid, &interrupt));
@@ -278,11 +277,15 @@ impl Drop for LockHolder {
 fn acquire_lock(
     t: &Transport,
     ws: &RemotePath,
+    locks: &RemotePath,
+    name: &str,
     wait_secs: u64,
     interrupt: &AtomicBool,
 ) -> Result<LockHolder, Failure> {
     let script = LockScript {
         workspace: ws,
+        locks,
+        name,
         wait_secs,
     }
     .render();

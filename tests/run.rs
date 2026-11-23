@@ -236,7 +236,7 @@ fn lock_timeout_is_124() {
     // First run creates the workspace; then hold its lock from inside the container.
     assert!(run(&s, &e, &["run", "--", "true"]).status.success());
     let held = s.ssh(
-        "for d in ~/.cache/hopbox/ws/*/; do nohup flock \"$d.hopbox.lock\" sleep 60 </dev/null >/dev/null 2>&1 & done; sleep 0.5",
+        "cd ~/.cache/hopbox && mkdir -p locks && for d in ws/*/; do n=${d#ws/}; nohup flock \"locks/${n%/}.lock\" sleep 60 </dev/null >/dev/null 2>&1 & done; sleep 0.5",
     );
     assert!(held.status.success());
     let o = hopbox(&s, &e, &e.sub, &["run", "--no-sync", "--", "echo", "ran"])
@@ -455,7 +455,7 @@ fn sync_waits_for_the_lock() {
     assert!(run(&s, &e, &["run", "--", "true"]).status.success());
     std::fs::write(e.root.join("README"), "edited\n").unwrap();
     let held = s.ssh(
-        "for d in ~/.cache/hopbox/ws/*/; do nohup flock \"$d.hopbox.lock\" sleep 60 </dev/null >/dev/null 2>&1 & done; sleep 0.5",
+        "cd ~/.cache/hopbox && mkdir -p locks && for d in ws/*/; do n=${d#ws/}; nohup flock \"locks/${n%/}.lock\" sleep 60 </dev/null >/dev/null 2>&1 & done; sleep 0.5",
     );
     assert!(held.status.success());
     let o = hopbox(&s, &e, &e.sub, &["run", "--", "true"])
