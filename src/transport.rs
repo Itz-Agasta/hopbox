@@ -18,6 +18,8 @@ pub struct Transport {
     dest: String,
     ssh_config: Option<PathBuf>,
     control_dir: PathBuf,
+    port: Option<u16>,
+    opts: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -94,7 +96,21 @@ impl Transport {
             dest: dest.to_owned(),
             ssh_config,
             control_dir,
+            port: None,
+            opts: Vec::new(),
         })
+    }
+
+    /// Transport for a resolved host, with its port and extra options (rented hosts).
+    pub fn for_host(r: &crate::config::Resolved) -> Result<Transport, TransportError> {
+        Ok(Transport::new(&r.ssh_dest)?.with_options(r.ssh_port, &r.ssh_opts))
+    }
+
+    /// Add `ssh -p <port>` and `-o <opt>` to every ssh this transport runs (rsync included).
+    pub fn with_options(mut self, port: Option<u16>, opts: &[String]) -> Transport {
+        self.port = port;
+        self.opts = opts.to_vec();
+        self
     }
 
     pub fn dest(&self) -> &str {
@@ -118,6 +134,14 @@ impl Transport {
         ] {
             args.push("-o".into());
             args.push(opt);
+        }
+        if let Some(port) = self.port {
+            args.push("-p".into());
+            args.push(port.to_string().into());
+        }
+        for opt in &self.opts {
+            args.push("-o".into());
+            args.push(opt.into());
         }
         args
     }
@@ -286,6 +310,28 @@ mod tests {
 
     fn strings(args: Vec<OsString>) -> Vec<String> {
         args.into_iter().map(|a| a.into_string().unwrap()).collect()
+    }
+
+    #[test]
+    fn base_args_port_opts() {
+        let d = tempfile::tempdir().unwrap();
+        let t = Transport::with_config("h", None, d.path().join("cm"))
+            .unwrap()
+            .with_options(
+                Some(40022),
+                &["StrictHostKeyChecking=accept-new".to_owned()],
+            );
+        let args: Vec<String> = t
+            .base_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let tail = &args[args.len() - 4..];
+        assert_eq!(
+            tail,
+            ["-p", "40022", "-o", "StrictHostKeyChecking=accept-new"]
+        );
+        assert!(t.rsync_rsh().contains("-p 40022"));
     }
 
     #[test]

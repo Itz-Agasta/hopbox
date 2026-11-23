@@ -26,6 +26,12 @@ pub struct HostConfig {
     pub shell: Option<String>,
     pub workspace_root: Option<String>,
     pub cost: Option<String>,
+    /// Set for rented hosts from the state file; not a config key.
+    #[serde(skip)]
+    pub ssh_port: Option<u16>,
+    /// Extra `ssh -o` options for rented hosts; not a config key.
+    #[serde(skip)]
+    pub ssh_options: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
