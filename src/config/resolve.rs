@@ -25,7 +25,7 @@ pub struct Resolved {
     /// `ssh -p`, for rented hosts.
     pub ssh_port: Option<u16>,
     /// Extra `ssh -o` options, for rented hosts.
-    pub ssh_opts: Vec<String>,
+    pub ssh_opts: Vec<std::ffi::OsString>,
     pub memory_max: Option<MemSize>,
     pub cpu_weight: Option<u16>,
     pub shell: Vec<String>,

@@ -60,7 +60,7 @@ fn paths_with_spaces_work() {
         .with_options(
             None,
             &[
-                "StrictHostKeyChecking=accept-new".to_owned(),
+                "StrictHostKeyChecking=accept-new".into(),
                 hopbox::transport::ssh_path_option("UserKnownHostsFile", &known),
             ],
         );

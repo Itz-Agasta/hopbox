@@ -31,7 +31,7 @@ pub struct HostConfig {
     pub ssh_port: Option<u16>,
     /// Extra `ssh -o` options for rented hosts; not a config key.
     #[serde(skip)]
-    pub ssh_options: Vec<String>,
+    pub ssh_options: Vec<std::ffi::OsString>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -76,7 +76,7 @@ pub fn merge_hosts(global: &mut GlobalConfig, instances: &[Instance], state_dir:
                 ssh: Some(format!("{}@{}", i.ssh_user, i.ssh_host)),
                 ssh_port: Some(i.ssh_port),
                 ssh_options: vec![
-                    "StrictHostKeyChecking=accept-new".to_owned(),
+                    "StrictHostKeyChecking=accept-new".into(),
                     crate::transport::ssh_path_option(
                         "UserKnownHostsFile",
                         &state_dir.join("known_hosts"),
