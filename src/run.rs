@@ -351,6 +351,12 @@ fn env_file_contents(flag_names: &[String], repo_names: &[String]) -> Result<Str
         if !valid {
             return Err(usage(format!("invalid environment variable name {name:?}")));
         }
+        // The run script keeps its own state in `__hopbox_*`; a forwarded value could break cleanup.
+        if name.starts_with("__hopbox_") {
+            return Err(usage(format!(
+                "environment variable name {name:?} uses the reserved __hopbox_ prefix"
+            )));
+        }
         match std::env::var(name) {
             Ok(value) => out += &format!("export {name}={}\n", shell_quote(&value)),
             Err(_) if from_flag => {
@@ -611,5 +617,14 @@ mod tests {
         let lines = tail_lines(&p, 2).unwrap();
         assert_eq!(lines[1], "last");
         assert!(lines[0].starts_with("bad "));
+    }
+
+    #[test]
+    fn env_rejects_reserved_hopbox_prefix() {
+        let err = env_file_contents(&["__hopbox_rm".to_owned()], &[]).unwrap_err();
+        assert_eq!(err.0, i32::from(exit::USAGE));
+        assert!(err.1.contains("reserved"), "{}", err.1);
+        let err = env_file_contents(&[], &["__hopbox_x".to_owned()]).unwrap_err();
+        assert!(err.1.contains("reserved"), "{}", err.1);
     }
 }
