@@ -54,7 +54,7 @@ hopbox: exit=1 source=remote host=hermes dur=42.1s log=/home/me/.local/state/hop
 
 ## Rent a GPU (costs money)
 
-Only when the job needs CUDA and the user agrees. Run `hopbox up vast --gpu <GPU> --ttl <time> --max-price <usd>` without `--yes-spend` first: it prints the offer and price, then exits 125 because there is no terminal. Show that price to the user. Rerun with `--yes-spend` only after they approve that price in the conversation. Then `hopbox run --host <name> -- …`, and `hopbox down <name>` when done. `hopbox ls` shows cost so far.
+Only when the job needs CUDA and the user agrees. Run `hopbox up vast --gpu <GPU> --ttl <time> --max-price <usd>` without `--yes-spend` first: it prints the offer and price, then exits 125 because there is no terminal. Show that price to the user. Only after they approve that price in the conversation, rerun with `--max-price` set to the approved hourly price and `--yes-spend`: the rerun searches again, and the lower `--max-price` keeps it from renting anything more expensive than what they approved. Then `hopbox run --host <name> -- …`, and `hopbox down <name>` when done. `hopbox ls` shows cost so far.
 
 ## Check a host
 
