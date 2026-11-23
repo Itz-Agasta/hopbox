@@ -61,6 +61,19 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Rent a GPU instance from a provider. Shows the price and asks before renting.
+    Up(UpArgs),
+    /// List rented instances with cost and time left; destroys any past their deadline.
+    Ls {
+        /// Print a JSON array instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Destroy a rented instance.
+    Down {
+        /// Name given to `hopbox up`.
+        name: String,
+    },
     /// Stop a background job and everything it started.
     Kill {
         /// Job id printed by `hopbox run --bg`.
@@ -69,6 +82,34 @@ pub enum Command {
         #[arg(long, value_name = "NAME")]
         host: Option<String>,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct UpArgs {
+    /// Provider to rent from.
+    #[arg(value_parser = ["vast"])]
+    pub provider: String,
+    /// GPU model as the provider names it, for example RTX_4090.
+    #[arg(long, value_name = "NAME")]
+    pub gpu: String,
+    /// The instance destroys itself after this long (for example 2h, 30m). Required.
+    #[arg(long, value_name = "AGE")]
+    pub ttl: String,
+    /// Highest price to accept, in USD per hour.
+    #[arg(long, value_name = "USD")]
+    pub max_price: Option<f64>,
+    /// Name to use with --host (default: vast-<random>).
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Disk size in GB.
+    #[arg(long, default_value_t = 30)]
+    pub disk: u32,
+    /// Container image.
+    #[arg(long, default_value = crate::provider::vast::DEFAULT_IMAGE)]
+    pub image: String,
+    /// Rent without asking. Only after a human has approved the price.
+    #[arg(long)]
+    pub yes_spend: bool,
 }
 
 #[derive(Debug, Default, Args)]
@@ -163,6 +204,24 @@ mod tests {
         assert_eq!(r.include, ["a", "b"]);
         assert!(r.json);
         assert_eq!(r.cmd, ["cargo", "test", "--", "--nocapture"]);
+    }
+
+    #[test]
+    fn up_parses_and_requires_ttl() {
+        let cli = parse(["hopbox", "up", "vast", "--gpu", "RTX_4090", "--ttl", "2h"]).unwrap();
+        let Command::Up(u) = cli.command else {
+            panic!("expected up")
+        };
+        assert_eq!(
+            (u.gpu.as_str(), u.ttl.as_str(), u.disk),
+            ("RTX_4090", "2h", 30)
+        );
+        assert!(!u.yes_spend && u.max_price.is_none());
+        assert!(
+            parse(["hopbox", "up", "vast", "--gpu", "X"]).is_err(),
+            "--ttl required"
+        );
+        assert!(parse(["hopbox", "up", "aws", "--gpu", "X", "--ttl", "1h"]).is_err());
     }
 
     #[test]
