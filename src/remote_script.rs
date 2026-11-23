@@ -278,7 +278,7 @@ pub fn gc_list_script(root: &RemotePath) -> String {
     format!(
         concat!(
             r#"echo "now=$(date +%s)"; cd {ws} 2>/dev/null || exit 0; "#,
-            r#"for d in */ .[!.]*/; do [ -d "$d" ] || continue; d=${{d%/}}; "#,
+            r#"for d in */ .[!.]*/ ..?*/; do [ -d "$d" ] || continue; d=${{d%/}}; "#,
             r#"t=$(stat -c %Y "$d/.hopbox-last-used" 2>/dev/null || stat -c %Y "$d"); "#,
             r#"echo "$t $d"; done"#,
         ),
@@ -576,7 +576,7 @@ mod tests {
             gc_list_script(&root),
             concat!(
                 r#"echo "now=$(date +%s)"; cd "$HOME"/.cache/hopbox/ws 2>/dev/null || exit 0; "#,
-                r#"for d in */ .[!.]*/; do [ -d "$d" ] || continue; d=${d%/}; "#,
+                r#"for d in */ .[!.]*/ ..?*/; do [ -d "$d" ] || continue; d=${d%/}; "#,
                 r#"t=$(stat -c %Y "$d/.hopbox-last-used" 2>/dev/null || stat -c %Y "$d"); "#,
                 r#"echo "$t $d"; done"#,
             )
@@ -593,6 +593,22 @@ mod tests {
                 r#"*) echo "failed $n $rc";; esac; done"#,
             )
         );
+    }
+
+    #[test]
+    fn gc_list_sees_every_name() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["a", ".b", "..c"] {
+            std::fs::create_dir_all(dir.path().join("ws").join(n)).unwrap();
+        }
+        let out = run_local(&gc_list_script(&gc_root(dir.path())));
+        let mut names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .skip(1)
+            .map(|l| l.split_once(' ').unwrap().1.to_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["..c", ".b", "a"]);
     }
 
     fn gc_root(dir: &Path) -> RemotePath {
