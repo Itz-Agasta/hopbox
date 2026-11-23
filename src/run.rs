@@ -166,7 +166,7 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     )?;
 
     // Forwards live only for this run; the guard stops them on every return path.
-    let _forwards = Forwards::open(&t, &ports, &interrupt)?;
+    let forwards = Forwards::open(&t, &ports, &interrupt)?;
 
     if !args.no_sync {
         let synced = sync(&t, &tree, &ws, &r, &|pid| track_pid(pid, &interrupt));
@@ -328,6 +328,8 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     if interrupt.load(Ordering::SeqCst) {
         return Err(interrupted());
     }
+    // Close our forwards before the lock goes, so a queued run can take the same ports.
+    drop(forwards);
     holder.release();
     Ok(result)
 }
