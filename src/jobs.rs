@@ -227,6 +227,8 @@ pub fn kill(id: &str, host: Option<&str>, env: &Env) -> i32 {
         let text = c.capture(&job_kill_script(&c.root, id), id)?;
         if text.trim() == "done" {
             println!("job {id} had already finished");
+        } else if text.trim() == "lost" {
+            println!("job {id} is not running (it ended without an exit code)");
         } else {
             println!("stopped job {id}");
         }

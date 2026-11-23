@@ -107,18 +107,27 @@ pub fn execute(host: Option<&str>, older_than: &str, dry_run: bool, env: &Env) -
     // Finished background jobs older than the window go too (their dirs hold logs only).
     let cutoff = now.saturating_sub(age.as_secs());
     let mut removed_jobs = 0;
+    let mut jobs_code = 0;
     match t.capture(&gc_jobs_script(&root, cutoff, !dry_run)) {
         Ok(o) if reachable(&o) => {
-            for id in String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|l| l.strip_prefix("job "))
-            {
-                removed_jobs += 1;
-                if dry_run {
-                    println!("would remove job {id}");
-                } else {
-                    println!("removed job {id}");
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if let Some(id) = line.strip_prefix("failed job ") {
+                    eprintln!("hopbox: failed to remove job {id}");
+                } else if let Some(id) = line.strip_prefix("job ") {
+                    removed_jobs += 1;
+                    if dry_run {
+                        println!("would remove job {id}");
+                    } else {
+                        println!("removed job {id}");
+                    }
                 }
+            }
+            if !o.status.success() {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                if !stderr.trim().is_empty() {
+                    eprintln!("hopbox: job cleanup on {}: {}", r.host_name, stderr.trim());
+                }
+                jobs_code = 1;
             }
         }
         Ok(o) => {
@@ -131,16 +140,16 @@ pub fn execute(host: Option<&str>, older_than: &str, dry_run: bool, env: &Env) -
         Err(e) => return fail(exit::USAGE, e.to_string()),
     }
     if old.is_empty() {
-        if removed_jobs == 0 {
+        if removed_jobs == 0 && jobs_code == 0 {
             println!("nothing to remove");
         }
-        return 0;
+        return jobs_code;
     }
     if dry_run {
         for (name, unused) in &old {
             println!("would remove {name} (unused {}d)", unused / 86_400);
         }
-        return 0;
+        return jobs_code;
     }
     let names: Vec<String> = old.into_iter().map(|(n, _)| n).collect();
     match t.capture(&gc_delete_script(&root, &names, cutoff)) {
@@ -167,7 +176,7 @@ pub fn execute(host: Option<&str>, older_than: &str, dry_run: bool, env: &Env) -
                 );
                 code = 1;
             }
-            code
+            code.max(jobs_code)
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
