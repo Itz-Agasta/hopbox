@@ -19,8 +19,9 @@
 </p>
 
 <p align="center">
-  <img src="assets/hopbox-banner.png" alt="hopbox: run heavy builds and tests on another machine over SSH" width="100%">
+  <img src="https://github.com/user-attachments/assets/e684e64c-8cf1-41a0-ab07-109ee223c83c" alt="hopbox: run heavy builds and tests on another machine over SSH" width="100%">
 </p>
+
 
 You keep working on your laptop. When a job is too heavy for it, `hopbox` copies the repo to a remote machine, runs the command there, streams the output back, and exits with the command's exit code:
 
