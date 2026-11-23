@@ -29,6 +29,8 @@ pub struct Status {
     pub log: Option<PathBuf>,
     pub oom: bool,
     pub error: Option<String>,
+    /// Background job id for `run --bg`.
+    pub job: Option<String>,
 }
 
 impl Status {
@@ -42,6 +44,7 @@ impl Status {
             log: None,
             oom: false,
             error: Some(error.into()),
+            job: None,
         }
     }
 
@@ -60,6 +63,9 @@ impl Status {
         if self.oom {
             s += " oom=true";
         }
+        if let Some(job) = &self.job {
+            s += &format!(" job={job}");
+        }
         if let Some(err) = &self.error {
             let one_line = err.replace(['\n', '\r'], " ").replace('"', "\\\"");
             s += &format!(" error=\"{one_line}\"");
@@ -77,6 +83,7 @@ impl Status {
             "log": self.log.as_ref().map(|p| p.display().to_string()),
             "oom": self.oom,
             "error": self.error,
+            "job": self.job,
         })
         .to_string()
     }
@@ -95,6 +102,7 @@ mod tests {
             log: None,
             oom: false,
             error: None,
+            job: None,
         }
     }
 
@@ -118,6 +126,20 @@ mod tests {
     }
 
     #[test]
+    fn status_line_job() {
+        let st = Status {
+            exit: 0,
+            source: Source::Hopbox,
+            job: Some("0a1b2c3d".into()),
+            ..base()
+        };
+        assert_eq!(
+            st.line(),
+            "hopbox: exit=0 source=hopbox host=hermes dur=12.3s job=0a1b2c3d"
+        );
+    }
+
+    #[test]
     fn status_json_fields() {
         let v: serde_json::Value = serde_json::from_str(&base().json()).unwrap();
         assert_eq!(v["exit"], 3);
@@ -125,7 +147,7 @@ mod tests {
         assert_eq!(v["host"], "hermes");
         assert_eq!(v["dur"], 12.345);
         assert_eq!(v["oom"], false);
-        assert!(v["log"].is_null() && v["error"].is_null());
+        assert!(v["log"].is_null() && v["error"].is_null() && v["job"].is_null());
         assert!(!base().json().contains('\n'));
     }
 }

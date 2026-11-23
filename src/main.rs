@@ -94,5 +94,6 @@ fn env() -> anyhow::Result<run::Env> {
         stdout_tty: std::io::stdout().is_terminal(),
         lock_wait_secs,
         log_dir: state.join("hopbox/logs"),
+        state_dir: state.join("hopbox"),
     })
 }

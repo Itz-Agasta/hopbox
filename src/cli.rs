@@ -58,6 +58,9 @@ pub struct RunArgs {
     /// Skip syncing and rerun on the existing remote copy.
     #[arg(long)]
     pub no_sync: bool,
+    /// Start the command as a background job, print its id, and return at once.
+    #[arg(long)]
+    pub bg: bool,
     /// Run a task from .hopbox.toml; words after `--` are appended.
     #[arg(long, value_name = "NAME")]
     pub task: Option<String>,
