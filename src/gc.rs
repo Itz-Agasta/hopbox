@@ -43,13 +43,14 @@ pub fn execute(host: Option<&str>, older_than: &str, dry_run: bool, env: &Env) -
         Ok(a) => a,
         Err(e) => return fail(exit::USAGE, e),
     };
-    let global = match &env.global_config {
+    let mut global = match &env.global_config {
         Some(p) => match config::load_global(p) {
             Ok(g) => g,
             Err(e) => return fail(exit::USAGE, e.to_string()),
         },
         None => config::GlobalConfig::default(),
     };
+    crate::state::add_rented(&mut global, &env.state_dir);
     let flags = RunFlags {
         host: host.map(str::to_owned),
         ..RunFlags::default()
@@ -58,7 +59,7 @@ pub fn execute(host: Option<&str>, older_than: &str, dry_run: bool, env: &Env) -
         Ok(r) => r,
         Err(e) => return fail(exit::USAGE, e.to_string()),
     };
-    let t = match Transport::new(&r.ssh_dest) {
+    let t = match Transport::for_host(&r) {
         Ok(t) => t,
         Err(e) => return fail(exit::USAGE, e.to_string()),
     };

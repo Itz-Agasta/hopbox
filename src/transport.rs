@@ -18,6 +18,8 @@ pub struct Transport {
     dest: String,
     ssh_config: Option<PathBuf>,
     control_dir: PathBuf,
+    port: Option<u16>,
+    opts: Vec<OsString>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +30,16 @@ pub enum TransportError {
     Unreachable { dest: String, stderr: String },
     #[error("preflight on {dest} failed: {stderr}")]
     Preflight { dest: String, stderr: String },
+}
+
+/// `Key="<path>"` for `ssh -o`: ssh splits unquoted values on whitespace, so a path with a
+/// space would become several values (or an error).
+pub fn ssh_path_option(key: &str, path: &std::path::Path) -> OsString {
+    // Built from the raw path bytes, so a non-UTF-8 path reaches ssh unchanged.
+    let mut opt = OsString::from(format!("{key}=\""));
+    opt.push(path.as_os_str());
+    opt.push("\"");
+    opt
 }
 
 /// A `--port` forward: local `127.0.0.1:<local>` to the remote's `localhost:<remote>`.
@@ -94,7 +106,21 @@ impl Transport {
             dest: dest.to_owned(),
             ssh_config,
             control_dir,
+            port: None,
+            opts: Vec::new(),
         })
+    }
+
+    /// Transport for a resolved host, with its port and extra options (rented hosts).
+    pub fn for_host(r: &crate::config::Resolved) -> Result<Transport, TransportError> {
+        Ok(Transport::new(&r.ssh_dest)?.with_options(r.ssh_port, &r.ssh_opts))
+    }
+
+    /// Add `ssh -p <port>` and `-o <opt>` to every ssh this transport runs (rsync included).
+    pub fn with_options(mut self, port: Option<u16>, opts: &[OsString]) -> Transport {
+        self.port = port;
+        self.opts = opts.to_vec();
+        self
     }
 
     pub fn dest(&self) -> &str {
@@ -107,8 +133,7 @@ impl Transport {
             args.push("-F".into());
             args.push(cfg.into());
         }
-        let mut control_path = OsString::from("ControlPath=");
-        control_path.push(self.control_dir.join("%C"));
+        let control_path = ssh_path_option("ControlPath", &self.control_dir.join("%C"));
         for opt in [
             OsString::from("ControlMaster=auto"),
             control_path,
@@ -118,6 +143,14 @@ impl Transport {
         ] {
             args.push("-o".into());
             args.push(opt);
+        }
+        if let Some(port) = self.port {
+            args.push("-p".into());
+            args.push(port.to_string().into());
+        }
+        for opt in &self.opts {
+            args.push("-o".into());
+            args.push(opt.clone());
         }
         args
     }
@@ -289,11 +322,38 @@ mod tests {
     }
 
     #[test]
+    fn ssh_path_option_keeps_raw_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/a\xffb".to_vec()));
+        let opt = ssh_path_option("ControlPath", &path);
+        assert_eq!(opt.as_bytes(), b"ControlPath=\"/tmp/a\xffb\"");
+    }
+
+    #[test]
+    fn base_args_port_opts() {
+        let d = tempfile::tempdir().unwrap();
+        let t = Transport::with_config("h", None, d.path().join("cm"))
+            .unwrap()
+            .with_options(Some(40022), &["StrictHostKeyChecking=accept-new".into()]);
+        let args: Vec<String> = t
+            .base_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let tail = &args[args.len() - 4..];
+        assert_eq!(
+            tail,
+            ["-p", "40022", "-o", "StrictHostKeyChecking=accept-new"]
+        );
+        assert!(t.rsync_rsh().contains("-p 40022"));
+    }
+
+    #[test]
     fn base_args_contain_connection_opts() {
         let d = tempfile::tempdir().unwrap();
         let t = Transport::with_config("h", None, d.path().join("cm")).unwrap();
         let args = strings(t.base_args());
-        let cp = format!("ControlPath={}/%C", d.path().join("cm").display());
+        let cp = format!("ControlPath=\"{}/%C\"", d.path().join("cm").display());
         let want = [
             "-o",
             "ControlMaster=auto",

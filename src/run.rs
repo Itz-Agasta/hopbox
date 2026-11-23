@@ -64,10 +64,11 @@ fn interrupted() -> Failure {
 
 fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<Status, Failure> {
     let tree = LocalTree::discover(&env.cwd).map_err(usage)?;
-    let global = match &env.global_config {
+    let mut global = match &env.global_config {
         Some(p) => config::load_global(p).map_err(usage)?,
         None => config::GlobalConfig::default(),
     };
+    crate::state::add_rented(&mut global, &env.state_dir);
     let repo = config::load_repo(&tree.root).map_err(usage)?;
     let flags = RunFlags {
         host: args.host.clone(),
@@ -107,7 +108,7 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         .collect::<Result<Vec<_>, _>>()?;
     let env_file_body = env_file_contents(&args.env, &repo.env)?;
 
-    let t = Transport::new(&r.ssh_dest).map_err(usage)?;
+    let t = Transport::for_host(&r).map_err(usage)?;
     let ws_name = workspace_name(&tree.root, &local_hostname());
     let ws = remote_workspace(&r.workspace_root, &ws_name);
     let locks = RemotePath::parse(&r.workspace_root).join("locks");

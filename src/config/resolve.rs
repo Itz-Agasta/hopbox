@@ -22,6 +22,10 @@ pub struct RunFlags {
 pub struct Resolved {
     pub host_name: String,
     pub ssh_dest: String,
+    /// `ssh -p`, for rented hosts.
+    pub ssh_port: Option<u16>,
+    /// Extra `ssh -o` options, for rented hosts.
+    pub ssh_opts: Vec<std::ffi::OsString>,
     pub memory_max: Option<MemSize>,
     pub cpu_weight: Option<u16>,
     pub shell: Vec<String>,
@@ -74,6 +78,8 @@ pub fn resolve(
     Ok(Resolved {
         host_name: host_name.clone(),
         ssh_dest: host.ssh.clone().unwrap_or_else(|| host_name.clone()),
+        ssh_port: host.ssh_port,
+        ssh_opts: host.ssh_options.clone(),
         memory_max,
         cpu_weight: host.cpu_weight,
         shell,
@@ -188,6 +194,8 @@ mod tests {
                 shell: Some("zsh -lc".into()),
                 workspace_root: Some("/srv/hb".into()),
                 cost: None,
+                ssh_port: Some(2222),
+                ssh_options: vec!["StrictHostKeyChecking=accept-new".into()],
             },
         );
         let r = resolve(&g, &RepoConfig::default(), &flags_host("h")).unwrap();
@@ -196,6 +204,8 @@ mod tests {
         assert_eq!(r.cpu_weight, Some(50));
         assert_eq!(r.shell, vec!["zsh", "-lc"]);
         assert_eq!(r.workspace_root, "/srv/hb");
+        assert_eq!(r.ssh_port, Some(2222));
+        assert_eq!(r.ssh_opts, ["StrictHostKeyChecking=accept-new"]);
     }
 
     #[test]

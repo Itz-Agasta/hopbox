@@ -30,10 +30,11 @@ struct Conn {
 /// Host: `--host`, else the one the job was started on, else `default_host`.
 fn connect(host: Option<&str>, id: Option<&str>, env: &Env) -> Result<Conn, Failure> {
     let usage = |e: &dyn std::fmt::Display| (exit::USAGE, e.to_string());
-    let global = match &env.global_config {
+    let mut global = match &env.global_config {
         Some(p) => config::load_global(p).map_err(|e| usage(&e))?,
         None => config::GlobalConfig::default(),
     };
+    crate::state::add_rented(&mut global, &env.state_dir);
     let recorded = id.and_then(|id| lookup(&env.state_dir.join("jobs.tsv"), id));
     let flags = RunFlags {
         host: host.map(str::to_owned).or(recorded),
@@ -41,7 +42,7 @@ fn connect(host: Option<&str>, id: Option<&str>, env: &Env) -> Result<Conn, Fail
     };
     let r =
         config::resolve(&global, &config::RepoConfig::default(), &flags).map_err(|e| usage(&e))?;
-    let t = Transport::new(&r.ssh_dest).map_err(|e| usage(&e))?;
+    let t = Transport::for_host(&r).map_err(|e| usage(&e))?;
     Ok(Conn {
         root: RemotePath::parse(&r.workspace_root),
         host: r.host_name,

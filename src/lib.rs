@@ -9,6 +9,7 @@ pub mod jobs;
 pub mod quote;
 pub mod remote_script;
 pub mod run;
+pub mod state;
 pub mod status;
 pub mod sync;
 pub mod transport;
