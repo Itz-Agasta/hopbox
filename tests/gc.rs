@@ -74,7 +74,7 @@ fn gc_skips_locked() {
     let Some(s) = common::sshd() else { return };
     make_workspaces(&s);
     let held = s.ssh(
-        "nohup flock ~/.cache/hopbox/ws/old-1/.hopbox.lock sleep 60 </dev/null >/dev/null 2>&1 & sleep 0.5",
+        "mkdir -p ~/.cache/hopbox/locks; nohup flock ~/.cache/hopbox/locks/old-1.lock sleep 60 </dev/null >/dev/null 2>&1 & sleep 0.5",
     );
     assert!(held.status.success());
     let o = gc(&s, &[]);

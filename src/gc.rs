@@ -115,16 +115,32 @@ pub fn execute(host: Option<&str>, older_than: &str, dry_run: bool, env: &Env) -
         return 0;
     }
     let names: Vec<String> = old.into_iter().map(|(n, _)| n).collect();
-    match t.capture(&gc_delete_script(&root, &names)) {
+    let cutoff = now.saturating_sub(age.as_secs());
+    match t.capture(&gc_delete_script(&root, &names, cutoff)) {
         Ok(o) if reachable(&o) => {
+            let mut code = 0;
             for line in String::from_utf8_lossy(&o.stdout).lines() {
                 if let Some(n) = line.strip_prefix("removed ") {
                     println!("removed {n}");
                 } else if let Some(n) = line.strip_prefix("busy ") {
                     println!("skipped {n}: in use");
+                } else if let Some(n) = line.strip_prefix("fresh ") {
+                    println!("skipped {n}: used since listing");
+                } else if let Some(rest) = line.strip_prefix("failed ") {
+                    let (n, rc) = rest.rsplit_once(' ').unwrap_or((rest, "?"));
+                    eprintln!("hopbox: failed to remove {n} (exit {rc})");
+                    code = 1;
                 }
             }
-            0
+            if !o.status.success() {
+                eprintln!(
+                    "hopbox: gc failed on {}: {}",
+                    r.host_name,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                code = 1;
+            }
+            code
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
