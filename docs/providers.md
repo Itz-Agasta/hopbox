@@ -23,7 +23,7 @@ hopbox searches for the best-value offer that matches, shows it, and asks before
 Rent RTX 4090 x1 · $0.45/h · South Korea · reliability 0.99 · up to $0.91 for 2h? [y/N]
 ```
 
-After you answer `y`, hopbox creates the instance, waits for it to start (up to 10 minutes), waits for SSH, and prints the name to use:
+After you answer `y`, hopbox creates the instance, waits for it to start (up to 20 minutes, since large images can take a while to download), waits for SSH, and prints the name to use:
 
 ```text
 hopbox: gpu1 is ready (destroys itself in 1h59m): hopbox run --host gpu1 -- <command>
@@ -41,7 +41,7 @@ hopbox: gpu1 is ready (destroys itself in 1h59m): hopbox run --host gpu1 -- <com
 
 hopbox only considers verified machines with direct ports and reliability above 0.98. It prices each offer with the disk size you asked for and rechecks the price against `--max-price` before renting.
 
-Without a terminal to ask on, `up` exits with code 125 unless you pass `--yes-spend`. If the instance fails to start, never reaches SSH, or doesn't start within 10 minutes, hopbox destroys it and exits with code 1.
+Without a terminal to ask on, `up` exits with code 125 unless you pass `--yes-spend`. If the instance fails to start, never reaches SSH, or doesn't start within 20 minutes, hopbox destroys it and exits with code 1.
 
 ## Run jobs on it
 
