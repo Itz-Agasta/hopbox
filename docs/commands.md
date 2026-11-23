@@ -41,7 +41,7 @@ hopbox uses `rsync` over a shared SSH connection. It sends your working tree, in
 - secret-looking files, which are never sent even with `--include`: `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `.aws/`, `.ssh/`, `.npmrc`, `.netrc`, `*.tfstate*`, and `.hopbox-secrets`
 - paths listed in `exclude` in `.hopbox.toml`
 
-Files you delete locally are deleted from the remote copy. Ignored folders that exist only on the remote, such as a remote `target/` or `node_modules/`, are kept, so remote builds stay incremental.
+When you delete a file locally, hopbox deletes it from the remote copy. Ignored folders that exist only on the remote, such as a remote `target/` or `node_modules/`, are kept, so remote builds stay incremental.
 
 Each worktree gets its own remote copy at `<workspace_root>/ws/<folder name>-<hash>`, so two worktrees can run jobs at the same time.
 
@@ -51,13 +51,15 @@ Only one `run` at a time uses a given remote copy. A second run from the same wo
 
 ### Memory and CPU limits
 
-When the host has a working `systemd-run --user`, each job runs in its own systemd scope with `MemoryMax` (and no swap) from `memory_max` or `--mem`, and `CPUWeight` from `cpu_weight`. A job that goes over its memory cap is killed, and the status line shows `exit=137` and `oom=true`.
+When the host has a working `systemd-run --user`, each job runs in its own systemd scope with `MemoryMax` (and no swap) from `memory_max` or `--mem`, and `CPUWeight` from `cpu_weight`. When a job goes over its memory cap, the kernel stops it and the status line shows `exit=137` and `oom=true`.
 
 Without `systemd-run --user`, hopbox prints `hopbox: warning: no resource caps on <host>` and runs the job without limits.
 
 ### Forwarded environment variables
 
-`--env NAME` values travel to the remote on stdin and land in a file only your remote user can read. The file is read and deleted before your command starts, so values never appear in a process list. A name passed with `--env` that isn't set locally is an error (exit 125). A name listed in `env` in `.hopbox.toml` that isn't set locally is skipped with a warning. Names starting with `__hopbox_` are reserved for hopbox and rejected with exit 125.
+hopbox sends `--env NAME` values over stdin to a file only your remote user can read. The remote side reads and deletes that file before your command starts, so values never appear in a process list.
+
+A name passed with `--env` that isn't set locally is an error (exit 125). A name listed in `env` in `.hopbox.toml` that isn't set locally is skipped with a warning. Names starting with `__hopbox_` are reserved for hopbox and rejected with exit 125.
 
 ### Stopping a job
 
@@ -91,7 +93,7 @@ Each forward uses its own SSH connection and closes when the run ends. If the lo
 
 A daemon that a job starts, such as an `sccache` server, can keep running after the job ends. On a host with resource caps, it stays inside the job's systemd scope, under the same memory and CPU limits.
 
-### Logs
+### Where `--tail` logs go
 
 With `--tail`, logs go to `$XDG_STATE_HOME/hopbox/logs/`, which defaults to `~/.local/state/hopbox/logs/`.
 
@@ -175,4 +177,6 @@ hopbox gc [host] [--older-than AGE] [--dry-run]
 | `--older-than AGE` | Remove copies unused for longer than `AGE`. Default: `14d`. |
 | `--dry-run` | Print what would be removed without deleting anything. |
 
-`gc` skips a copy whose lock is held by a running job and prints `skipped <name>: in use`. It also skips a copy that a run used after `gc` listed it and prints `skipped <name>: used since listing`. If a copy can't be removed, `gc` prints the error and exits with code 1. `gc` also removes finished background jobs whose exit is older than `AGE`, printing `removed job <id>`. Remote copies are disposable: the next `run` from that worktree recreates its copy with a full sync.
+`gc` skips a copy whose lock is held by a running job and prints `skipped <name>: in use`. It also skips a copy that a run used after `gc` listed it and prints `skipped <name>: used since listing`. If `gc` can't remove a copy, it prints the error and exits with code 1.
+
+`gc` also removes finished background jobs whose exit is older than `AGE`, printing `removed job <id>`. Remote copies are disposable: the next `run` from that worktree recreates its copy with a full sync.

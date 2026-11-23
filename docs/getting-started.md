@@ -9,7 +9,7 @@ You need:
 - A remote machine you can reach with `ssh <host>` without a password prompt, for example over Tailscale or with an SSH key
 - `ssh` and `rsync` on your laptop
 - `rsync`, `bash`, and `flock` (from util-linux) on the remote
-- Linux on the remote. Your laptop can run Linux or macOS.
+- Linux on the remote, and Linux or macOS on your laptop
 
 hopbox installs nothing on the remote and opens no ports.
 

@@ -17,13 +17,13 @@ hopbox runs the `vastai` CLI for you and never stores or sends your vast credent
 hopbox up vast --gpu RTX_4090 --ttl 2h --max-price 0.60 --name gpu1
 ```
 
-hopbox searches for the best-value offer that matches, shows it, and asks before renting:
+hopbox picks the matching offer with the best performance per dollar, shows it, and asks before renting:
 
 ```text
 Rent RTX 4090 x1 · $0.45/h · South Korea · reliability 0.99 · up to $0.91 for 2h? [y/N]
 ```
 
-After you answer `y`, hopbox creates the instance, waits for it to start (up to 20 minutes, since large images can take a while to download), waits for SSH, and prints the name to use:
+After you answer `y`, hopbox creates the instance and waits for it to start. Large images can take a while to download, so hopbox waits up to 20 minutes. Once SSH works, it prints the name to use:
 
 ```text
 hopbox: gpu1 is ready (destroys itself in 1h59m): hopbox run --host gpu1 -- <command>
@@ -64,7 +64,7 @@ NAME                 ID  STATUS    GPU              $/H      AGE     COST  LEFT
 gpu1           31337000  running   RTX 4090        0.45      42m    $0.32  1h17m
 ```
 
-`COST` is an estimate: the hourly price times the time since the instance started. `LEFT` is the time until the instance destroys itself. An instance labelled by hopbox that this laptop has no record of shows `untracked`. `--json` prints the same rows as a JSON array, with `age` and `left` in seconds.
+`COST` is an estimate: the hourly price times the time since the instance started. `LEFT` is the time until the instance destroys itself. `LEFT` shows `untracked` for a hopbox instance this laptop has no record of. `--json` prints the same rows as a JSON array, with `age` and `left` in seconds.
 
 `ls` also cleans up: it destroys any instance past its deadline, in case the instance couldn't destroy itself, and forgets instances that no longer exist on vast.
 
@@ -84,4 +84,4 @@ If you stop hopbox while `up` is waiting, the instance keeps running until its d
 
 ## What hopbox touches
 
-hopbox labels every instance it creates `hopbox-<name>` and only ever lists, checks, or destroys instances with that label. Your other vast instances are never touched.
+hopbox labels every instance it creates `hopbox-<name>` and only ever lists, checks, or destroys instances with that label, so it never touches your other vast instances.
