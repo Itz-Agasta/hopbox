@@ -15,7 +15,13 @@ hopbox installs nothing on the remote and opens no ports.
 
 ## Install
 
-Build from source with Rust 1.85 or newer:
+Run the installer, which downloads the right prebuilt binary for Linux or macOS on x86_64 or ARM:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Itz-Agasta/hopbox/releases/latest/download/hopbox-installer.sh | sh
+```
+
+You can also download an archive from the [releases page](https://github.com/Itz-Agasta/hopbox/releases), or build from source with Rust 1.85 or newer:
 
 ```sh
 cargo install --git https://github.com/Itz-Agasta/hopbox
