@@ -30,6 +30,38 @@ pub enum TransportError {
     Preflight { dest: String, stderr: String },
 }
 
+/// A `--port` forward: local `127.0.0.1:<local>` to the remote's `localhost:<remote>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortSpec {
+    pub local: u16,
+    pub remote: u16,
+}
+
+impl PortSpec {
+    /// `3000` or `LOCAL:REMOTE`, each 1-65535.
+    pub fn parse(s: &str) -> Result<PortSpec, String> {
+        let bad = || format!("invalid port {s:?}: use PORT or LOCAL:REMOTE (1-65535)");
+        let port = |p: &str| p.parse::<u16>().ok().filter(|&n| n != 0).ok_or_else(bad);
+        match s.split_once(':') {
+            Some((l, r)) => Ok(PortSpec {
+                local: port(l)?,
+                remote: port(r)?,
+            }),
+            None => {
+                let p = port(s)?;
+                Ok(PortSpec {
+                    local: p,
+                    remote: p,
+                })
+            }
+        }
+    }
+
+    fn arg(&self) -> String {
+        format!("127.0.0.1:{}:localhost:{}", self.local, self.remote)
+    }
+}
+
 /// What the preflight learned about the remote.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Preflight {
@@ -161,6 +193,23 @@ impl Transport {
         rsh
     }
 
+    /// Start a dedicated, non-multiplexed `ssh -N -L` for one forward. The forward belongs to
+    /// this process alone: killing it removes exactly this forward, never another run's or
+    /// one from `~/.ssh/config` on the shared ControlMaster.
+    pub fn spawn_forward(&self, p: PortSpec) -> Result<Child, TransportError> {
+        Ok(Command::new("ssh")
+            // ssh keeps the first value of an option, so these override the base args.
+            .args(["-o", "ControlMaster=no", "-o", "ControlPath=none"])
+            .args(["-o", "ExitOnForwardFailure=yes"])
+            .args(self.base_args())
+            .args(["-N", "-L", &p.arg(), "--"])
+            .arg(&self.dest)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?)
+    }
+
     /// Open the connection, create the workspace, and probe for resource caps.
     pub fn preflight(&self, ws: &RemotePath) -> Result<Preflight, TransportError> {
         let out = self.capture(&preflight_script(ws))?;
@@ -205,6 +254,34 @@ fn default_control_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn port_spec_parse() {
+        assert_eq!(
+            PortSpec::parse("3000"),
+            Ok(PortSpec {
+                local: 3000,
+                remote: 3000
+            })
+        );
+        assert_eq!(
+            PortSpec::parse("8080:3000"),
+            Ok(PortSpec {
+                local: 8080,
+                remote: 3000
+            })
+        );
+        for bad in ["", "0", "70000", "a", "1:", ":1", "1:2:3", "-1"] {
+            assert!(PortSpec::parse(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            PortSpec {
+                local: 8080,
+                remote: 3000
+            }
+            .arg(),
+            "127.0.0.1:8080:localhost:3000"
+        );
+    }
     use super::*;
 
     fn strings(args: Vec<OsString>) -> Vec<String> {

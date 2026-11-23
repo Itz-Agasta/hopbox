@@ -21,7 +21,7 @@ use crate::remote_script::{
 };
 use crate::status::{Source, Status};
 use crate::sync::{SyncError, relative_path, sync};
-use crate::transport::{Transport, TransportError};
+use crate::transport::{PortSpec, Transport, TransportError};
 use crate::workspace::{LocalTree, local_hostname, remote_workspace, workspace_name};
 
 /// Internal hook: lock wait in seconds. Used by the integration tests.
@@ -79,9 +79,16 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     let r = config::resolve(&global, &repo, &flags).map_err(usage)?;
     *host = r.host_name.clone();
     let cmd = command_for(args, &r)?;
-    if args.bg && (!args.fetch.is_empty() || args.tail.is_some()) {
-        return Err(usage("--bg cannot be combined with --fetch or --tail"));
+    if args.bg && (!args.fetch.is_empty() || args.tail.is_some() || !args.port.is_empty()) {
+        return Err(usage(
+            "--bg cannot be combined with --fetch, --tail or --port",
+        ));
     }
+    let ports = args
+        .port
+        .iter()
+        .map(|p| PortSpec::parse(p).map_err(usage))
+        .collect::<Result<Vec<_>, _>>()?;
     if args.bg && !r.fetch.is_empty() {
         eprintln!(
             "hopbox: warning: fetch paths from .hopbox.toml are not copied back for --bg jobs"
@@ -157,6 +164,9 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         },
         &interrupt,
     )?;
+
+    // Forwards live only for this run; the guard stops them on every return path.
+    let forwards = Forwards::open(&t, &ports, &interrupt)?;
 
     if !args.no_sync {
         let synced = sync(&t, &tree, &ws, &r, &|pid| track_pid(pid, &interrupt));
@@ -318,8 +328,85 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     if interrupt.load(Ordering::SeqCst) {
         return Err(interrupted());
     }
+    // Close our forwards before the lock goes, so a queued run can take the same ports.
+    drop(forwards);
     holder.release();
     Ok(result)
+}
+
+/// `--port` forwards, one owned ssh process each, stopped when dropped.
+struct Forwards {
+    procs: Vec<Child>,
+}
+
+/// How long a new forward has to start accepting connections.
+const FORWARD_READY: Duration = Duration::from_secs(15);
+
+impl Forwards {
+    fn open(
+        t: &Transport,
+        ports: &[PortSpec],
+        interrupt: &AtomicBool,
+    ) -> Result<Forwards, Failure> {
+        let mut f = Forwards { procs: Vec::new() };
+        for &p in ports {
+            // A busy port (another run's forward or any other listener) is never shared.
+            // On error `f` drops here and stops the forwards already open.
+            drop(
+                std::net::TcpListener::bind(("127.0.0.1", p.local))
+                    .map_err(|e| usage(format!("cannot forward port {}: {e}", p.local)))?,
+            );
+            let mut child = t.spawn_forward(p).map_err(usage)?;
+            let ready = wait_listening(&mut child, p.local, interrupt);
+            f.procs.push(child);
+            match ready {
+                Listen::Ready => {}
+                Listen::Interrupted => return Err(interrupted()),
+                Listen::Failed => {
+                    return Err(usage(format!(
+                        "cannot forward port {}: ssh did not start listening",
+                        p.local
+                    )));
+                }
+            }
+        }
+        Ok(f)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Listen {
+    Ready,
+    Failed,
+    Interrupted,
+}
+
+/// Wait until something accepts on `127.0.0.1:<port>` while `child` is still running.
+/// Ctrl-C ends the wait at once (the caller's guard then stops the child).
+fn wait_listening(child: &mut Child, port: u16, interrupt: &AtomicBool) -> Listen {
+    let deadline = Instant::now() + FORWARD_READY;
+    while Instant::now() < deadline {
+        if interrupt.load(Ordering::SeqCst) {
+            return Listen::Interrupted;
+        }
+        if !matches!(child.try_wait(), Ok(None)) {
+            return Listen::Failed;
+        }
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Listen::Ready;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Listen::Failed
+}
+
+impl Drop for Forwards {
+    fn drop(&mut self) {
+        for c in &mut self.procs {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
 }
 
 /// The lock-holder ssh session. Closing its stdin releases the lock.
@@ -688,6 +775,28 @@ fn install_interrupt(t: &Transport, unit: Option<UnitName>) -> Arc<AtomicBool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forward_wait_stops_on_interrupt() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let interrupt = AtomicBool::new(true);
+        let t = Instant::now();
+        assert_eq!(
+            wait_listening(&mut child, port, &interrupt),
+            Listen::Interrupted
+        );
+        assert!(t.elapsed() < Duration::from_secs(2));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn tail_lines_keeps_only_the_end() {

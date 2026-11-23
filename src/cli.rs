@@ -97,6 +97,9 @@ pub struct RunArgs {
     /// Skip syncing and rerun on the existing remote copy.
     #[arg(long)]
     pub no_sync: bool,
+    /// Forward local PORT (or LOCAL:REMOTE) to the remote's localhost while the run lasts (repeatable).
+    #[arg(long, value_name = "PORT")]
+    pub port: Vec<String>,
     /// Start the command as a background job, print its id, and return at once.
     #[arg(long)]
     pub bg: bool,
