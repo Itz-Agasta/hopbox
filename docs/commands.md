@@ -50,7 +50,7 @@ Without `systemd-run --user`, hopbox prints `hopbox: warning: no resource caps o
 
 ### Forwarded environment variables
 
-`--env NAME` values travel to the remote on stdin and land in a file only your remote user can read. The file is read and deleted before your command starts, so values never appear in a process list. A name passed with `--env` that isn't set locally is an error (exit 125). A name listed in `env` in `.hopbox.toml` that isn't set locally is skipped with a warning.
+`--env NAME` values travel to the remote on stdin and land in a file only your remote user can read. The file is read and deleted before your command starts, so values never appear in a process list. A name passed with `--env` that isn't set locally is an error (exit 125). A name listed in `env` in `.hopbox.toml` that isn't set locally is skipped with a warning. Names starting with `__hopbox_` are reserved for hopbox and rejected with exit 125.
 
 ### Stopping a job
 
@@ -92,4 +92,4 @@ hopbox gc [host] [--older-than AGE] [--dry-run]
 | `--older-than AGE` | Remove copies unused for longer than `AGE`. Default: `14d`. |
 | `--dry-run` | Print what would be removed without deleting anything. |
 
-`gc` skips a copy whose lock is held by a running job and prints `skipped <name>: in use`. Remote copies are disposable: the next `run` from that worktree recreates its copy with a full sync.
+`gc` skips a copy whose lock is held by a running job and prints `skipped <name>: in use`. It also skips a copy that a run used after `gc` listed it and prints `skipped <name>: used since listing`. If a copy can't be removed, `gc` prints the error and exits with code 1. Remote copies are disposable: the next `run` from that worktree recreates its copy with a full sync.
