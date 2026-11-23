@@ -166,7 +166,7 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     )?;
 
     // Forwards live only for this run; the guard stops them on every return path.
-    let _forwards = Forwards::open(&t, &ports)?;
+    let _forwards = Forwards::open(&t, &ports, &interrupt)?;
 
     if !args.no_sync {
         let synced = sync(&t, &tree, &ws, &r, &|pid| track_pid(pid, &interrupt));
@@ -341,7 +341,11 @@ struct Forwards {
 const FORWARD_READY: Duration = Duration::from_secs(15);
 
 impl Forwards {
-    fn open(t: &Transport, ports: &[PortSpec]) -> Result<Forwards, Failure> {
+    fn open(
+        t: &Transport,
+        ports: &[PortSpec],
+        interrupt: &AtomicBool,
+    ) -> Result<Forwards, Failure> {
         let mut f = Forwards { procs: Vec::new() };
         for &p in ports {
             // A busy port (another run's forward or any other listener) is never shared.
@@ -351,32 +355,47 @@ impl Forwards {
                     .map_err(|e| usage(format!("cannot forward port {}: {e}", p.local)))?,
             );
             let mut child = t.spawn_forward(p).map_err(usage)?;
-            let ready = wait_listening(&mut child, p.local);
+            let ready = wait_listening(&mut child, p.local, interrupt);
             f.procs.push(child);
-            if !ready {
-                return Err(usage(format!(
-                    "cannot forward port {}: ssh did not start listening",
-                    p.local
-                )));
+            match ready {
+                Listen::Ready => {}
+                Listen::Interrupted => return Err(interrupted()),
+                Listen::Failed => {
+                    return Err(usage(format!(
+                        "cannot forward port {}: ssh did not start listening",
+                        p.local
+                    )));
+                }
             }
         }
         Ok(f)
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Listen {
+    Ready,
+    Failed,
+    Interrupted,
+}
+
 /// Wait until something accepts on `127.0.0.1:<port>` while `child` is still running.
-fn wait_listening(child: &mut Child, port: u16) -> bool {
+/// Ctrl-C ends the wait at once (the caller's guard then stops the child).
+fn wait_listening(child: &mut Child, port: u16, interrupt: &AtomicBool) -> Listen {
     let deadline = Instant::now() + FORWARD_READY;
     while Instant::now() < deadline {
+        if interrupt.load(Ordering::SeqCst) {
+            return Listen::Interrupted;
+        }
         if !matches!(child.try_wait(), Ok(None)) {
-            return false;
+            return Listen::Failed;
         }
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
+            return Listen::Ready;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    false
+    Listen::Failed
 }
 
 impl Drop for Forwards {
@@ -754,6 +773,28 @@ fn install_interrupt(t: &Transport, unit: Option<UnitName>) -> Arc<AtomicBool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forward_wait_stops_on_interrupt() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let interrupt = AtomicBool::new(true);
+        let t = Instant::now();
+        assert_eq!(
+            wait_listening(&mut child, port, &interrupt),
+            Listen::Interrupted
+        );
+        assert!(t.elapsed() < Duration::from_secs(2));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn tail_lines_keeps_only_the_end() {
