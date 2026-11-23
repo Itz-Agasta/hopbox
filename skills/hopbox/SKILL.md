@@ -52,6 +52,10 @@ hopbox: exit=1 source=remote host=hermes dur=42.1s log=/home/me/.local/state/hop
 - `source=hopbox`: hopbox could not run the command (unreachable host, missing `rsync`, bad config, or `exit=124` when another run held the workspace for 10 minutes). Report the `error` to the user. Never rerun the command locally as a substitute; the user offloaded it because the laptop can't handle it.
 - Add `--json` if you would rather parse one JSON object with the same fields.
 
+## Rent a GPU (costs money)
+
+Only when the job needs CUDA and the user agrees. Run `hopbox up vast --gpu <GPU> --ttl <time> --max-price <usd>` without `--yes-spend` first: it prints the offer and price, then exits 125 because there is no terminal. Show that price to the user. Only after they approve that price in the conversation, rerun with `--max-price` set to the approved hourly price and `--yes-spend`: the rerun searches again, and the lower `--max-price` keeps it from renting anything more expensive than what they approved. Then `hopbox run --host <name> -- …`, and `hopbox down <name>` when done. `hopbox ls` shows cost so far.
+
 ## Check a host
 
 Run `hopbox doctor [host]` when a host is new or a run fails with `source=hopbox`. It reports reachability, required tools, free RAM and disk, and CPU architecture. Report missing toolchains to the user; installing software on their remote is their decision.

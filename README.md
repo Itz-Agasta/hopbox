@@ -2,7 +2,7 @@
 
 Run heavy builds and tests on another machine over SSH, from your laptop or your coding agent.
 
-> **Status: v0.1.** `hopbox run`, `hopbox doctor`, and `hopbox gc` work against any SSH host. Renting GPU machines is planned. See the [documentation](docs/README.md).
+> **Status: v0.3.** `hopbox run` (foreground or `--bg`, with `--port` forwarding), `jobs`, `logs`, `wait`, `kill`, `doctor`, and `gc` work against any SSH host, and `hopbox up vast` rents a GPU box that destroys itself at its deadline. See the [documentation](docs/README.md).
 
 You keep working on your laptop. When a job is too heavy for it, `hopbox` copies the repo to a remote machine, runs the command there, streams the output back, and exits with the command's exit code:
 
