@@ -53,3 +53,4 @@ hopbox limits what an agent can do on your behalf:
 - hopbox forwards no environment variables unless the agent names them with `--env`, and secret files never leave your laptop.
 - Every job runs under the host's memory and CPU caps, so a runaway build can't take down other services on the remote.
 - hopbox never falls back to running a job locally when the remote is unreachable.
+- `hopbox up` never rents without a human yes. An agent shows you the price `up` prints and passes `--yes-spend` only after you approve that price in the conversation.
