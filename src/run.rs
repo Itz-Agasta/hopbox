@@ -12,13 +12,15 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::cli::{RunArgs, command_string};
-use crate::config::{self, RunFlags};
+use crate::config::{self, Resolved, RunFlags};
 use crate::exit;
+use crate::quote::shell_quote;
 use crate::remote_script::{
-    Caps, LOCKED_LINE, LockScript, RunScript, UnitName, oom_check_script, stop_script,
+    Caps, LOCKED_LINE, LockScript, RemotePath, RunScript, UnitName, env_remove_script,
+    env_write_script, oom_check_script, stop_script,
 };
 use crate::status::{Source, Status};
-use crate::sync::{SyncError, sync};
+use crate::sync::{SyncError, relative_path, sync};
 use crate::transport::{Transport, TransportError};
 use crate::workspace::{LocalTree, local_hostname, remote_workspace, workspace_name};
 
@@ -59,17 +61,6 @@ fn interrupted() -> Failure {
 }
 
 fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<Status, Failure> {
-    for (flag, used) in [
-        ("--fetch", !args.fetch.is_empty()),
-        ("--env", !args.env.is_empty()),
-        ("--task", args.task.is_some()),
-    ] {
-        if used {
-            return Err(usage(format!("{flag} is not implemented yet")));
-        }
-    }
-    let cmd = command_string(&args.cmd).ok_or_else(|| usage("no command: pass it after --"))?;
-
     let tree = LocalTree::discover(&env.cwd).map_err(usage)?;
     let global = match &env.global_config {
         Some(p) => config::load_global(p).map_err(usage)?,
@@ -85,6 +76,19 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     };
     let r = config::resolve(&global, &repo, &flags).map_err(usage)?;
     *host = r.host_name.clone();
+    let cmd = command_for(args, &r)?;
+    let fetch = r
+        .fetch
+        .iter()
+        .map(|p| {
+            relative_path(p).ok_or_else(|| {
+                usage(format!(
+                    "invalid fetch path {p:?}: use a path relative to the current directory without '..'"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let env_file_body = env_file_contents(&args.env, &repo.env)?;
 
     let t = Transport::new(&r.ssh_dest).map_err(usage)?;
     let ws = remote_workspace(
@@ -122,6 +126,35 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
             other => usage(other),
         })?;
     }
+    // Fallible local setup first, so nothing below can fail with secrets left on the remote.
+    let log = match args.tail {
+        Some(_) => Some(open_log(&env.log_dir, &unit)?),
+        None => None,
+    };
+    let env_file = format!(".hopbox-env-{}", unit.id());
+    let env_file = if env_file_body.is_empty() {
+        None
+    } else {
+        let out = t.capture_input(
+            &env_write_script(&ws, &env_file),
+            env_file_body.as_bytes(),
+            &|pid| track_pid(pid, &interrupt),
+        );
+        CHILD_PID.store(0, Ordering::SeqCst);
+        if interrupt.load(Ordering::SeqCst) {
+            let _ = t.capture(&env_remove_script(&ws, &env_file));
+            return Err(interrupted());
+        }
+        let out = out.map_err(usage)?;
+        if !out.status.success() {
+            return Err(usage(format!(
+                "cannot write the env file on {}: {}",
+                r.host_name,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Some(env_file)
+    };
     if caps.is_none() {
         eprintln!("hopbox: warning: no resource caps on {}", r.host_name);
     }
@@ -131,15 +164,19 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         caps: caps.as_ref(),
         shell: &r.shell,
         cmd: &cmd,
+        env_file: env_file.as_deref(),
     }
     .render();
 
-    let log = match args.tail {
-        Some(_) => Some(open_log(&env.log_dir, &unit)?),
-        None => None,
+    let mut child = match t.spawn(&script, env.stdout_tty) {
+        Ok(c) => c,
+        Err(e) => {
+            if let Some(f) = &env_file {
+                let _ = t.capture(&env_remove_script(&ws, f));
+            }
+            return Err(usage(e));
+        }
     };
-
-    let mut child = t.spawn(&script, env.stdout_tty).map_err(usage)?;
     track_child(&child, &interrupt);
     let out = forward(
         child.stdout.take().expect("piped"),
@@ -210,6 +247,10 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
             }
         }
     }
+    fetch_back(&t, &ws, &tree, &fetch, &interrupt);
+    if interrupt.load(Ordering::SeqCst) {
+        return Err(interrupted());
+    }
     holder.release();
     Ok(result)
 }
@@ -236,7 +277,7 @@ impl Drop for LockHolder {
 /// Start the lock holder and wait until it reports `locked` (or fails).
 fn acquire_lock(
     t: &Transport,
-    ws: &crate::remote_script::RemotePath,
+    ws: &RemotePath,
     wait_secs: u64,
     interrupt: &AtomicBool,
 ) -> Result<LockHolder, Failure> {
@@ -266,6 +307,136 @@ fn acquire_lock(
         ),
         code => usage(format!("cannot lock the workspace (exit {code:?})")),
     })
+}
+
+/// The command from `--task NAME` (plus extra words) or from the words after `--`.
+fn command_for(args: &RunArgs, r: &Resolved) -> Result<String, Failure> {
+    let extra = command_string(&args.cmd);
+    let Some(name) = &args.task else {
+        return extra.ok_or_else(|| usage("no command: pass it after -- or use --task NAME"));
+    };
+    let base = r.tasks.get(name).ok_or_else(|| {
+        let known = if r.tasks.is_empty() {
+            "none".to_owned()
+        } else {
+            r.tasks.keys().cloned().collect::<Vec<_>>().join(", ")
+        };
+        usage(format!("unknown task {name:?}; tasks: {known}"))
+    })?;
+    Ok(match extra {
+        Some(extra) => format!("{base} {extra}"),
+        None => base.clone(),
+    })
+}
+
+/// `export NAME='value'` lines for the env file. `--env` names must be set locally;
+/// names from the repo config that are unset are skipped with a warning.
+fn env_file_contents(flag_names: &[String], repo_names: &[String]) -> Result<String, Failure> {
+    let mut out = String::new();
+    let mut seen: Vec<&str> = Vec::new();
+    let all = flag_names
+        .iter()
+        .map(|n| (n, true))
+        .chain(repo_names.iter().map(|n| (n, false)));
+    for (name, from_flag) in all {
+        if seen.contains(&name.as_str()) {
+            continue;
+        }
+        seen.push(name);
+        let valid = name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return Err(usage(format!("invalid environment variable name {name:?}")));
+        }
+        // The run script keeps its own state in `__hopbox_*`; a forwarded value could break cleanup.
+        if name.starts_with("__hopbox_") {
+            return Err(usage(format!(
+                "environment variable name {name:?} uses the reserved __hopbox_ prefix"
+            )));
+        }
+        match std::env::var(name) {
+            Ok(value) => out += &format!("export {name}={}\n", shell_quote(&value)),
+            Err(_) if from_flag => {
+                return Err(usage(format!(
+                    "--env {name}: not set locally (or not UTF-8)"
+                )));
+            }
+            Err(_) => eprintln!("hopbox: warning: env {name} is not set locally; skipping"),
+        }
+    }
+    Ok(out)
+}
+
+/// Copy each path back from the remote copy of the current subdirectory. Failures warn only.
+fn fetch_back(
+    t: &Transport,
+    ws: &RemotePath,
+    tree: &LocalTree,
+    paths: &[String],
+    interrupt: &AtomicBool,
+) {
+    let local_cwd = tree.root.join(&tree.subdir);
+    for p in paths {
+        if interrupt.load(Ordering::SeqCst) {
+            return;
+        }
+        let rel_parent = Path::new(p).parent().unwrap_or(Path::new(""));
+        if symlink_on_path(&local_cwd, rel_parent) {
+            eprintln!("hopbox: warning: fetch {p} skipped: a parent directory is a symlink");
+            continue;
+        }
+        let mut remote = ws.rsync_arg();
+        for part in [tree.subdir.as_str(), p.as_str()] {
+            if !part.is_empty() {
+                remote.push('/');
+                remote.push_str(part);
+            }
+        }
+        let parent = local_cwd.join(Path::new(p).parent().unwrap_or(Path::new("")));
+        let status = std::fs::create_dir_all(&parent).and_then(|_| {
+            let mut dest = parent.into_os_string();
+            dest.push("/");
+            let mut child = std::process::Command::new("rsync")
+                .args(["-a", "-s", "-e"])
+                .arg(t.rsync_rsh())
+                .arg(format!("{}:{remote}", t.dest()))
+                .arg(dest)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            track_pid(child.id(), interrupt);
+            let status = child.wait();
+            CHILD_PID.store(0, Ordering::SeqCst);
+            status
+        });
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!(
+                "hopbox: warning: fetch {p} failed (rsync exit {})",
+                s.code().unwrap_or(-1)
+            ),
+            Err(e) => eprintln!("hopbox: warning: fetch {p} failed ({e})"),
+        }
+    }
+}
+
+/// Whether any existing directory between `base` and `base/rel` is a symlink, which could
+/// redirect a fetch outside the checkout.
+fn symlink_on_path(base: &Path, rel: &Path) -> bool {
+    let mut cur = base.to_path_buf();
+    for part in rel.components() {
+        cur.push(part);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 fn exit_code(status: ExitStatus) -> i32 {
@@ -446,5 +617,14 @@ mod tests {
         let lines = tail_lines(&p, 2).unwrap();
         assert_eq!(lines[1], "last");
         assert!(lines[0].starts_with("bad "));
+    }
+
+    #[test]
+    fn env_rejects_reserved_hopbox_prefix() {
+        let err = env_file_contents(&["__hopbox_rm".to_owned()], &[]).unwrap_err();
+        assert_eq!(err.0, i32::from(exit::USAGE));
+        assert!(err.1.contains("reserved"), "{}", err.1);
+        let err = env_file_contents(&[], &["__hopbox_x".to_owned()]).unwrap_err();
+        assert!(err.1.contains("reserved"), "{}", err.1);
     }
 }
