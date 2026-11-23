@@ -1,0 +1,13 @@
+{
+  "name": "hopbox",
+  "displayName": "hopbox",
+  "description": "Teaches your agent when to offload heavy builds and tests to a remote machine with hopbox, and how to read the result.",
+  "author": {
+    "name": "Itz-Agasta",
+    "url": "https://github.com/Itz-Agasta"
+  },
+  "homepage": "https://github.com/Itz-Agasta/hopbox",
+  "repository": "https://github.com/Itz-Agasta/hopbox",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["ssh", "remote", "build", "tests", "offload", "gpu"]
+}
