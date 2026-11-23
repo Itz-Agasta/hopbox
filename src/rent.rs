@@ -110,8 +110,16 @@ pub fn with_state<T>(
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if lock_is_stale(&lock) {
-                    let _ = std::fs::remove_dir_all(&lock);
-                    continue;
+                    match std::fs::remove_dir_all(&lock) {
+                        // NotFound: another hopbox cleared it first; try to take it.
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                            return Err(failed(format!(
+                                "cannot remove stale lock {}: {e}",
+                                lock.display()
+                            )));
+                        }
+                        _ => continue,
+                    }
                 }
                 tries += 1;
                 if tries > 200 {
@@ -818,6 +826,31 @@ mod tests {
         std::fs::write(lock.join("pid"), pid.to_string()).unwrap();
         assert_eq!(with_state(d.path(), |l| Ok(l.len())).unwrap(), 0);
         assert!(!lock.exists());
+    }
+
+    #[test]
+    fn unremovable_stale_lock_is_an_error_not_a_spin() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let lock = d.path().join("instances.lock");
+        std::fs::create_dir(&lock).unwrap();
+        assert!(
+            std::process::Command::new("touch")
+                .args(["-d", "5 minutes ago"])
+                .arg(&lock)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::remove_dir(&lock).is_ok() {
+            return; // root
+        }
+        let t = std::time::Instant::now();
+        let r = with_state(d.path(), |l| Ok(l.len()));
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(r.is_err());
+        assert!(t.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
