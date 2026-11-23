@@ -16,7 +16,7 @@ use crate::config::{self, Resolved, RunFlags};
 use crate::exit;
 use crate::quote::shell_quote;
 use crate::remote_script::{
-    BG_STARTED_LINE, Caps, LOCKED_LINE, LockScript, RemotePath, RunScript, UnitName,
+    BG_STARTED_LINE, BgStart, Caps, LOCKED_LINE, LockScript, RemotePath, RunScript, UnitName,
     bg_wrapper_script, env_remove_script, env_write_script, oom_check_script, stop_script,
 };
 use crate::status::{Source, Status};
@@ -126,15 +126,17 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         env_file: env_name.as_deref(),
     }
     .render();
-    let bg_script = args.bg.then(|| {
-        let job_dir = RemotePath::parse(&r.workspace_root)
-            .join("jobs")
-            .join(unit.id());
-        let meta = [
-            format!("ws={ws_name}"),
-            format!("cmd={}", cmd.replace(['\n', '\r'], " ")),
-        ];
-        bg_wrapper_script(&job_dir, &script, caps.as_ref().map(|c| &c.unit), &meta)
+    let jobs = RemotePath::parse(&r.workspace_root).join("jobs");
+    let meta = [
+        format!("ws={ws_name}"),
+        format!("cmd={}", cmd.replace(['\n', '\r'], " ")),
+    ];
+    let wrapper = args.bg.then(|| {
+        bg_wrapper_script(
+            &jobs.join(unit.id()),
+            &script,
+            caps.as_ref().map(|c| &c.unit),
+        )
     });
 
     // One lock for sync, job and fetch, so a second run can't change files under this one.
@@ -146,7 +148,12 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
             locks: &locks,
             name: &ws_name,
             wait_secs: env.lock_wait_secs,
-            bg: bg_script.as_deref(),
+            bg: wrapper.as_deref().map(|wrapper| BgStart {
+                jobs: &jobs,
+                id: unit.id(),
+                meta: &meta,
+                wrapper,
+            }),
         },
         &interrupt,
     )?;
@@ -198,9 +205,12 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         eprintln!("hopbox: warning: no resource caps on {}", r.host_name);
     }
     if args.bg {
-        if let Err(e) = holder.launch() {
+        if let Err((code, e)) = holder.launch(&interrupt) {
             if let Some(f) = &env_file {
                 let _ = t.capture(&env_remove_script(&ws, f));
+            }
+            if code == i32::from(exit::INTERRUPTED) {
+                return Err((code, e));
             }
             return Err(usage(format!(
                 "cannot start the job on {}: {e}",
@@ -320,17 +330,31 @@ struct LockHolder {
 
 impl LockHolder {
     /// Tell a background lock holder to start its job, and wait for it to confirm.
-    fn launch(mut self) -> Result<(), String> {
-        let mut stdin = self.child.stdin.take().ok_or("lock holder has no stdin")?;
-        stdin.write_all(b"go\n").map_err(|e| e.to_string())?;
+    /// Ctrl-C while waiting kills the holder ssh, so a stalled start can't hang the run.
+    fn launch(mut self, interrupt: &AtomicBool) -> Result<(), Failure> {
+        let mut stdin = self
+            .child
+            .stdin
+            .take()
+            .ok_or_else(|| usage("lock holder has no stdin"))?;
+        track_child(&self.child, interrupt);
+        let sent = stdin.write_all(b"go\n");
         drop(stdin);
         let mut line = String::new();
-        let _ = self.stdout.read_line(&mut line);
+        if sent.is_ok() {
+            let _ = self.stdout.read_line(&mut line);
+        }
         let _ = self.child.wait();
+        CHILD_PID.store(0, Ordering::SeqCst);
+        if interrupt.load(Ordering::SeqCst) {
+            return Err(interrupted());
+        }
         if line.trim_end() == BG_STARTED_LINE {
             Ok(())
         } else {
-            Err("the remote did not confirm the start".to_owned())
+            Err(usage(
+                "the remote did not confirm the start (job dir exists or is not writable)",
+            ))
         }
     }
 

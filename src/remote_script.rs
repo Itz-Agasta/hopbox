@@ -135,9 +135,21 @@ pub struct LockScript<'a> {
     pub locks: &'a RemotePath,
     pub name: &'a str,
     pub wait_secs: u64,
-    /// For `run --bg`: once stdin sends `go`, start this script detached (it inherits the
-    /// lock fd, so the lock stays held until the job ends) and print `started`.
-    pub bg: Option<&'a str>,
+    /// For `run --bg`: once stdin sends `go`, reserve the job dir, start the wrapper detached
+    /// (it inherits the lock fd, so the lock stays held until the job ends) and print `started`.
+    pub bg: Option<BgStart<'a>>,
+}
+
+/// What [`LockScript`] needs to start a background job.
+#[derive(Debug, Clone, Copy)]
+pub struct BgStart<'a> {
+    /// `<workspace_root>/jobs`; the job dir is `<jobs>/<id>`.
+    pub jobs: &'a RemotePath,
+    pub id: &'a str,
+    /// `key=value` lines for the job's `meta` file (`start=<epoch>` is appended).
+    pub meta: &'a [String],
+    /// From [`bg_wrapper_script`].
+    pub wrapper: &'a str,
 }
 
 impl LockScript<'_> {
@@ -157,12 +169,31 @@ impl LockScript<'_> {
             locked = LOCKED_LINE,
             tail = match self.bg {
                 None => "exec cat >/dev/null".to_owned(),
-                Some(script) => format!(
-                    "IFS= read -r go && [ \"$go\" = go ] && \
-                     {{ setsid nohup sh -c {} </dev/null >/dev/null 2>&1 & echo {BG_STARTED_LINE}; }}",
-                    shell_quote(script)
-                ),
+                Some(bg) => bg.render(),
             },
+        )
+    }
+}
+
+impl BgStart<'_> {
+    /// The lock script's tail: plain `mkdir` reserves the job dir (an existing one is never
+    /// reused), and `meta` and `pid` are written before `started` is printed, so a printed id
+    /// always has a job dir that `wait`, `logs` and `kill` can use.
+    fn render(&self) -> String {
+        let jd = self.jobs.join(self.id).render();
+        let meta: Vec<String> = self
+            .meta
+            .iter()
+            .map(|m| shell_quote(m).into_owned())
+            .collect();
+        format!(
+            "IFS= read -r go && [ \"$go\" = go ] && mkdir -p {jobs} && mkdir {jd} && \
+             {{ printf '%s\\n' {meta}; echo \"start=$(date +%s)\"; }} > {jd}/meta && \
+             {{ setsid nohup sh -c {wrapper} </dev/null >/dev/null 2>&1 & \
+             echo $! > {jd}/pid && echo {BG_STARTED_LINE}; }}",
+            jobs = self.jobs.render(),
+            meta = meta.join(" "),
+            wrapper = shell_quote(self.wrapper),
         )
     }
 }
@@ -170,23 +201,14 @@ impl LockScript<'_> {
 /// Printed by [`LockScript`] after it starts a background job.
 pub const BG_STARTED_LINE: &str = "started";
 
-/// The detached wrapper of a background job, run from `<job_dir>`: records `pid` (also the
-/// process group, thanks to `setsid`) and `meta`, runs `run` with the lock fd closed and its
-/// output in `log`, then writes `exit` atomically (137 plus an `oom` file when the memory
-/// cap killed it).
-pub fn bg_wrapper_script(
-    job_dir: &RemotePath,
-    run: &str,
-    unit: Option<&UnitName>,
-    meta: &[String],
-) -> String {
-    let meta: Vec<String> = meta.iter().map(|m| shell_quote(m).into_owned()).collect();
+/// The detached wrapper of a background job (its pid is also its process group, thanks to
+/// `setsid`): runs `run` from `<job_dir>` with the lock fd closed and its output in `log`,
+/// then writes `exit` atomically (137 plus an `oom` file when the memory cap killed it).
+/// It survives a TERM to its process group, so a killed job still gets an `exit` file.
+pub fn bg_wrapper_script(job_dir: &RemotePath, run: &str, unit: Option<&UnitName>) -> String {
     let mut s = format!(
-        "mkdir -p {jd} && cd {jd} && echo $$ > pid && \
-         {{ printf '%s\\n' {meta}; echo \"start=$(date +%s)\"; }} > meta && \
-         {{ ( {run} ) 9>&- >log 2>&1; rc=$?; ",
+        "trap true TERM; cd {jd} && {{ ( {run} ) 9>&- >log 2>&1; rc=$?; ",
         jd = job_dir.render(),
-        meta = meta.join(" "),
     );
     if let Some(u) = unit {
         let scope = shell_quote(&u.scope()).into_owned();
@@ -834,21 +856,75 @@ mod tests {
     #[test]
     fn lock_script_bg_tail() {
         let ws = RemotePath::parse("/w");
+        let jobs = RemotePath::parse("/r/jobs");
+        let meta = ["cmd=echo hi".to_owned()];
         let s = LockScript {
             workspace: &ws,
             locks: &RemotePath::parse("/l"),
             name: "n",
             wait_secs: 1,
-            bg: Some("echo 'job'"),
+            bg: Some(BgStart {
+                jobs: &jobs,
+                id: "0a1b2c3d",
+                meta: &meta,
+                wrapper: "echo 'job'",
+            }),
         }
         .render();
         assert!(
             s.ends_with(concat!(
-                r#"echo locked && IFS= read -r go && [ "$go" = go ] && "#,
-                r#"{ setsid nohup sh -c 'echo '\''job'\''' </dev/null >/dev/null 2>&1 & echo started; }"#
+                r#"echo locked && IFS= read -r go && [ "$go" = go ] && mkdir -p /r/jobs && "#,
+                r#"mkdir /r/jobs/0a1b2c3d && { printf '%s\n' 'cmd=echo hi'; echo "start=$(date +%s)"; } "#,
+                r#"> /r/jobs/0a1b2c3d/meta && { setsid nohup sh -c 'echo '\''job'\''' "#,
+                r#"</dev/null >/dev/null 2>&1 & echo $! > /r/jobs/0a1b2c3d/pid && echo started; }"#,
             )),
             "{s}"
         );
+    }
+
+    /// Run the bg tail in real sh, feeding `go`, with a lock-free layout under `dir`.
+    fn run_bg_tail(dir: &Path, id: &str, wrapper: &str) -> std::process::Output {
+        use std::io::Write;
+        let root = RemotePath::Abs(dir.to_str().unwrap().to_owned());
+        let (ws, locks, jobs) = (root.join("ws/w"), root.join("locks"), root.join("jobs"));
+        let meta = ["cmd=x".to_owned()];
+        let script = LockScript {
+            workspace: &ws,
+            locks: &locks,
+            name: "w",
+            wait_secs: 1,
+            bg: Some(BgStart {
+                jobs: &jobs,
+                id,
+                meta: &meta,
+                wrapper,
+            }),
+        }
+        .render();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(wrap_for_ssh(&script))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"go\n").unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    #[test]
+    fn bg_start_reserves_job_dir_once() {
+        if !have_flock() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_bg_tail(dir.path(), "0a1b2c3d", "true");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "locked\nstarted\n");
+        let jd = dir.path().join("jobs/0a1b2c3d");
+        assert!(jd.join("pid").exists() && jd.join("meta").exists());
+        // Same id again: the existing dir is never reused, and no `started`.
+        let out = run_bg_tail(dir.path(), "0a1b2c3d", "true");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "locked\n");
     }
 
     #[test]
@@ -856,16 +932,14 @@ mod tests {
         let jd = RemotePath::parse("/r/jobs/0a1b2c3d");
         let unit = UnitName::random();
         let scope = unit.scope();
-        let meta = ["ws=w-1".to_owned(), "cmd=echo hi".to_owned()];
         assert_eq!(
-            bg_wrapper_script(&jd, "exec x", None, &meta),
+            bg_wrapper_script(&jd, "exec x", None),
             concat!(
-                "mkdir -p /r/jobs/0a1b2c3d && cd /r/jobs/0a1b2c3d && echo $$ > pid && ",
-                r#"{ printf '%s\n' ws=w-1 'cmd=echo hi'; echo "start=$(date +%s)"; } > meta && "#,
+                "trap true TERM; cd /r/jobs/0a1b2c3d && ",
                 "{ ( exec x ) 9>&- >log 2>&1; rc=$?; echo $rc > exit.tmp && mv exit.tmp exit; }",
             )
         );
-        let capped = bg_wrapper_script(&jd, "exec x", Some(&unit), &meta);
+        let capped = bg_wrapper_script(&jd, "exec x", Some(&unit));
         assert!(capped.contains(&format!(
             "r=$(systemctl --user show -p Result --value {scope} 2>/dev/null); "
         )));
@@ -875,19 +949,17 @@ mod tests {
     #[test]
     fn bg_wrapper_runs_in_real_sh() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("j")).unwrap();
         let jd = RemotePath::Abs(dir.path().join("j").to_str().unwrap().to_owned());
         let out = run_local(&bg_wrapper_script(
             &jd,
             "echo out; echo err >&2; exit 5",
             None,
-            &["cmd=x".to_owned()],
         ));
         assert!(out.status.success());
         let read = |f: &str| std::fs::read_to_string(dir.path().join("j").join(f)).unwrap();
         assert_eq!(read("exit"), "5\n");
         assert_eq!(read("log"), "out\nerr\n");
-        assert!(read("meta").starts_with("cmd=x\nstart="));
-        assert!(read("pid").trim().parse::<u32>().is_ok());
     }
 
     fn hold_lock(lock: &Path) -> KillOnDrop {
