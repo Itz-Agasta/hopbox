@@ -279,7 +279,7 @@ pub fn gc_list_script(root: &RemotePath) -> String {
         concat!(
             r#"echo "now=$(date +%s)"; cd {ws} 2>/dev/null || exit 0; "#,
             r#"for d in */ .[!.]*/ ..?*/; do [ -d "$d" ] || continue; d=${{d%/}}; "#,
-            r#"t=$(stat -c %Y "$d/.hopbox-last-used" 2>/dev/null || stat -c %Y "$d"); "#,
+            r#"t=$(stat -c %Y -- "$d/.hopbox-last-used" 2>/dev/null || stat -c %Y -- "$d"); "#,
             r#"echo "$t $d"; done"#,
         ),
         ws = root.join("ws").render()
@@ -297,7 +297,7 @@ pub fn gc_delete_script(root: &RemotePath, names: &[String], cutoff: u64) -> Str
             r#"cd {ws} || exit 0; mkdir -p {locks} || exit 1; "#,
             r#"for n in {names}; do ( exec 8>{locks}/"$n.lock" && "#,
             r#"{{ flock -n 8 || exit 75; }} && "#,
-            r#"t=$(stat -c %Y "$n/.hopbox-last-used" 2>/dev/null || stat -c %Y "$n") && "#,
+            r#"t=$(stat -c %Y -- "$n/.hopbox-last-used" 2>/dev/null || stat -c %Y -- "$n") && "#,
             r#"{{ [ "$t" -le {cutoff} ] || exit 76; }} && rm -rf -- "$n" ); rc=$?; "#,
             r#"case $rc in 0) echo "removed $n";; 75) echo "busy $n";; 76) echo "fresh $n";; "#,
             r#"*) echo "failed $n $rc";; esac; done"#,
@@ -577,7 +577,7 @@ mod tests {
             concat!(
                 r#"echo "now=$(date +%s)"; cd "$HOME"/.cache/hopbox/ws 2>/dev/null || exit 0; "#,
                 r#"for d in */ .[!.]*/ ..?*/; do [ -d "$d" ] || continue; d=${d%/}; "#,
-                r#"t=$(stat -c %Y "$d/.hopbox-last-used" 2>/dev/null || stat -c %Y "$d"); "#,
+                r#"t=$(stat -c %Y -- "$d/.hopbox-last-used" 2>/dev/null || stat -c %Y -- "$d"); "#,
                 r#"echo "$t $d"; done"#,
             )
         );
@@ -587,7 +587,7 @@ mod tests {
                 r#"cd "$HOME"/.cache/hopbox/ws || exit 0; mkdir -p "$HOME"/.cache/hopbox/locks || exit 1; "#,
                 r#"for n in old-1 'my repo-2'; do ( exec 8>"$HOME"/.cache/hopbox/locks/"$n.lock" && "#,
                 r#"{ flock -n 8 || exit 75; } && "#,
-                r#"t=$(stat -c %Y "$n/.hopbox-last-used" 2>/dev/null || stat -c %Y "$n") && "#,
+                r#"t=$(stat -c %Y -- "$n/.hopbox-last-used" 2>/dev/null || stat -c %Y -- "$n") && "#,
                 r#"{ [ "$t" -le 1000 ] || exit 76; } && rm -rf -- "$n" ); rc=$?; "#,
                 r#"case $rc in 0) echo "removed $n";; 75) echo "busy $n";; 76) echo "fresh $n";; "#,
                 r#"*) echo "failed $n $rc";; esac; done"#,
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn gc_list_sees_every_name() {
         let dir = tempfile::tempdir().unwrap();
-        for n in ["a", ".b", "..c"] {
+        for n in ["a", ".b", "..c", "-d"] {
             std::fs::create_dir_all(dir.path().join("ws").join(n)).unwrap();
         }
         let out = run_local(&gc_list_script(&gc_root(dir.path())));
@@ -608,7 +608,22 @@ mod tests {
             .map(|l| l.split_once(' ').unwrap().1.to_owned())
             .collect();
         names.sort();
-        assert_eq!(names, ["..c", ".b", "a"]);
+        assert_eq!(names, ["-d", "..c", ".b", "a"]);
+    }
+
+    #[test]
+    fn gc_delete_handles_dash_names() {
+        if !have_flock() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ws/-d")).unwrap();
+        let out = run_local(&gc_delete_script(
+            &gc_root(dir.path()),
+            &["-d".into()],
+            4_000_000_000,
+        ));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "removed -d\n");
     }
 
     fn gc_root(dir: &Path) -> RemotePath {
