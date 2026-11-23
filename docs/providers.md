@@ -32,14 +32,14 @@ hopbox: gpu1 is ready (destroys itself in 1h59m): hopbox run --host gpu1 -- <com
 | Option | What it does |
 |---|---|
 | `--gpu NAME` | GPU model as vast names it, such as `RTX_4090` or `H100_SXM`. Required. |
-| `--ttl AGE` | Destroy the instance after `AGE`, such as `30m`, `2h`, or `1d`. Required. |
+| `--ttl AGE` | Destroy the instance after `AGE`, such as `30m`, `2h`, or `1d`. Required, at most `30d`. |
 | `--max-price USD` | Highest price to accept, in US dollars per hour. |
 | `--name NAME` | Name for `--host`: 1 to 32 lowercase letters, digits, or `-`. Default: `vast-` plus 4 random hex characters. Can't match a host in your config. |
 | `--disk GB` | Disk size. Default: `30`. |
 | `--image IMAGE` | Container image. Default: `vastai/pytorch:@vastai-automatic-tag`. |
 | `--yes-spend` | Rent without asking. Use it only after a human has approved the price. |
 
-hopbox only considers verified machines with direct ports and reliability above 0.98, and it rechecks each offer's price against `--max-price` before renting.
+hopbox only considers verified machines with direct ports and reliability above 0.98. It prices each offer with the disk size you asked for and rechecks the price against `--max-price` before renting.
 
 Without a terminal to ask on, `up` exits with code 125 unless you pass `--yes-spend`. If the instance fails to start, never reaches SSH, or doesn't start within 10 minutes, hopbox destroys it and exits with code 1.
 
@@ -74,7 +74,7 @@ gpu1           31337000  running   RTX 4090        0.45      42m    $0.32  1h17m
 hopbox down gpu1
 ```
 
-`down` checks that the instance still carries its `hopbox-gpu1` label, destroys it, and forgets it. Destroying stops all billing, including storage.
+`down` checks that the instance still carries its `hopbox-gpu1` label, destroys it, and forgets it. Destroying stops all billing, including storage. If the instance no longer exists on vast, `down` prints `gpu1 was already gone` and forgets it.
 
 ## How the deadline works
 
