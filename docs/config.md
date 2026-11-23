@@ -1,6 +1,6 @@
 # Configuration
 
-hopbox reads two files: a global config with your hosts, and an optional `.hopbox.toml` in each repo. Unknown keys in either file are an error, so a typo fails loudly instead of being ignored.
+hopbox reads two files: a global config with your hosts, and an optional `.hopbox.toml` in each repo. An unknown key in either file is an error, so hopbox reports a typo instead of silently ignoring it.
 
 ## Global config
 
@@ -58,4 +58,4 @@ e2e = "npx playwright test"
 | `env` | Environment variables to forward when they are set locally. |
 | `tasks` | Named commands for `hopbox run --task NAME`. |
 
-Command-line flags add to these lists: `--include`, `--fetch`, and `--env` values are appended to the repo's.
+Command-line flags add to these lists: hopbox appends `--include`, `--fetch`, and `--env` values to the repo's.
