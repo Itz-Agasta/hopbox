@@ -59,6 +59,22 @@ fn main() -> ExitCode {
         Command::Logs { id, follow, host } => {
             with_env(|env| jobs::logs(&id, host.as_deref(), follow, env))
         }
+        Command::Up(a) => with_env(|env| {
+            hopbox::rent::execute_up(
+                &hopbox::rent::UpArgs {
+                    gpu: a.gpu.clone(),
+                    ttl: a.ttl.clone(),
+                    max_price: a.max_price,
+                    name: a.name.clone(),
+                    disk: a.disk,
+                    image: a.image.clone(),
+                    yes_spend: a.yes_spend,
+                },
+                &env.state_dir,
+            )
+        }),
+        Command::Ls { json } => with_env(|env| hopbox::rent::execute_ls(json, &env.state_dir)),
+        Command::Down { name } => with_env(|env| hopbox::rent::execute_down(&name, &env.state_dir)),
         Command::Kill { id, host } => with_env(|env| jobs::kill(&id, host.as_deref(), env)),
         Command::Wait { id, host, json } => {
             let status = match env() {
