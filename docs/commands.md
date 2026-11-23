@@ -1,6 +1,11 @@
 # Commands
 
-hopbox has three commands: `run` executes a job on a remote host, `doctor` checks a host, and `gc` removes old remote copies.
+hopbox runs jobs on a remote host and manages what they leave behind:
+
+- `run` executes a job, in the foreground or as a background job
+- `jobs`, `logs`, `wait`, and `kill` manage background jobs
+- `doctor` checks a host
+- `gc` removes old remote copies and finished background jobs
 
 ## `hopbox run`
 
@@ -24,6 +29,8 @@ The command runs in the remote copy of your current directory: run it from `crat
 | `--mem SIZE` | Memory cap for this run, such as `2G`. Overrides the host's `memory_max`. |
 | `--no-sync` | Skip syncing and run on the copy already on the remote. |
 | `--json` | Print the final status as one JSON object instead of a text line. |
+| `--bg` | Start the job in the background, print its id, and return at once. See [Background jobs](#background-jobs). |
+| `--port PORT` | Forward local `PORT` to the same port on the remote's `localhost` while the run lasts. Use `LOCAL:REMOTE` for different ports. Repeatable. |
 
 ### What gets synced
 
@@ -56,9 +63,85 @@ Without `systemd-run --user`, hopbox prints `hopbox: warning: no resource caps o
 
 Press Ctrl-C (or send SIGTERM) to stop. On a host with resource caps, hopbox stops the job's whole scope on the remote. On a host without them, hopbox stops the local side, and the remote command may keep running until it finishes. Either way hopbox exits with code 130.
 
+### Background jobs
+
+`--bg` starts the job and returns as soon as it's running. hopbox prints the job id on stdout and adds `job=<id>` to the status line:
+
+```sh
+hopbox run --bg -- cargo build --release
+# 3f9c2a1b
+# hopbox: exit=0 source=hopbox host=hermes dur=2.3s job=3f9c2a1b
+```
+
+The job keeps running when you close the terminal, lose the connection, or put your laptop to sleep. It holds the remote copy's lock until it ends, so a later `run` from the same worktree waits for it. Its output goes to a log on the remote: read it with `hopbox logs`, and get its exit code with `hopbox wait`.
+
+`--bg` can't be combined with `--fetch`, `--tail`, or `--port`, and exits with code 125 if you try. Paths listed in `fetch` in `.hopbox.toml` aren't copied back for background jobs.
+
+### Port forwarding
+
+`--port 3000` makes `localhost:3000` on your laptop reach `localhost:3000` on the remote while the run lasts, so you can open a dev server the job starts:
+
+```sh
+hopbox run --port 3000 -- npm run dev
+```
+
+Each forward uses its own SSH connection and closes when the run ends. If the local port is already in use, including by another run's forward, hopbox exits with code 125 before starting the job.
+
+### Processes a job leaves running
+
+A daemon that a job starts, such as an `sccache` server, can keep running after the job ends. On a host with resource caps, it stays inside the job's systemd scope, under the same memory and CPU limits.
+
 ### Logs
 
 With `--tail`, logs go to `$XDG_STATE_HOME/hopbox/logs/`, which defaults to `~/.local/state/hopbox/logs/`.
+
+## `hopbox jobs`
+
+```sh
+hopbox jobs [--host NAME] [--json]
+```
+
+`jobs` lists background jobs on a host (default: `default_host`):
+
+```text
+ID        STATE    EXIT   AGE  COMMAND
+3f9c2a1b  done        0   12m  cargo build --release
+8d0e4f67  running     -   40s  cargo nextest run
+```
+
+| State | Meaning |
+|---|---|
+| `running` | The job is still running. |
+| `done` | The job finished; `EXIT` is its exit code. |
+| `lost` | The job's process is gone without an exit code, for example after the remote rebooted. |
+
+`--json` prints a JSON array of objects with `id`, `state`, `exit`, `start` (Unix seconds), `cmd`, and `host`.
+
+## `hopbox logs`
+
+```sh
+hopbox logs <id> [-f] [--host NAME]
+```
+
+`logs` prints a background job's output. `-f` keeps printing new output until the job ends.
+
+## `hopbox wait`
+
+```sh
+hopbox wait <id> [--host NAME] [--json]
+```
+
+`wait` blocks until a background job ends, then exits with the job's exit code and prints a status line with `source=remote` and `job=<id>`, like a foreground `run`. A job the memory cap killed exits with 137 and `oom=true`. A `lost` job exits with 125.
+
+## `hopbox kill`
+
+```sh
+hopbox kill <id> [--host NAME]
+```
+
+`kill` stops a background job and every process it started. The job records exit code 143. hopbox checks that the recorded process is still the job before it sends a signal, so it never stops an unrelated process that reused the job's process id.
+
+`logs`, `wait`, and `kill` find the host on their own: hopbox remembers which host each job id started on. Pass `--host` to override. An id that isn't 8 lowercase hex characters, or that doesn't exist on the host, exits with code 125.
 
 ## `hopbox doctor`
 
@@ -92,4 +175,4 @@ hopbox gc [host] [--older-than AGE] [--dry-run]
 | `--older-than AGE` | Remove copies unused for longer than `AGE`. Default: `14d`. |
 | `--dry-run` | Print what would be removed without deleting anything. |
 
-`gc` skips a copy whose lock is held by a running job and prints `skipped <name>: in use`. It also skips a copy that a run used after `gc` listed it and prints `skipped <name>: used since listing`. If a copy can't be removed, `gc` prints the error and exits with code 1. Remote copies are disposable: the next `run` from that worktree recreates its copy with a full sync.
+`gc` skips a copy whose lock is held by a running job and prints `skipped <name>: in use`. It also skips a copy that a run used after `gc` listed it and prints `skipped <name>: used since listing`. If a copy can't be removed, `gc` prints the error and exits with code 1. `gc` also removes finished background jobs whose exit is older than `AGE`, printing `removed job <id>`. Remote copies are disposable: the next `run` from that worktree recreates its copy with a full sync.

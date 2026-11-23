@@ -26,6 +26,19 @@ hopbox run --tail 60 -- cargo nextest run
 - Use `--host NAME` to pick a host other than the default.
 - Use `--task NAME` to run a task defined in the repo's `.hopbox.toml`.
 
+## Run a long job in the background
+
+For a job that takes several minutes, start it with `--bg` and keep working:
+
+```sh
+id=$(hopbox run --bg -- cargo build --release)
+hopbox wait "$id"        # later: exits with the job's code, same status line
+```
+
+`hopbox logs "$id"` shows output so far; `hopbox jobs` lists jobs; `hopbox kill "$id"` stops one. `--bg` can't be combined with `--tail`, `--fetch`, or `--port`.
+
+Use `--port 3000` on a foreground run to open a remote dev server at `localhost:3000`.
+
 ## Read the result
 
 The last line is always the status line:
