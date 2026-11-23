@@ -1,6 +1,6 @@
 # Exit codes
 
-`hopbox run` exits with your command's own exit code, so scripts and agents can treat a remote run like a local one. The status line on the last line of stderr tells you whether a code came from your command or from hopbox.
+`hopbox run` and `hopbox wait` exit with your command's own exit code, so scripts and agents can treat a remote run like a local one. The status line on the last line of stderr tells you whether a code came from your command or from hopbox.
 
 ## Status line
 
@@ -17,11 +17,12 @@ hopbox: exit=1 source=remote host=hermes dur=42.1s
 | `log` | Path of the full log, with `--tail`. |
 | `oom` | `true` when the memory cap killed the job. |
 | `error` | What went wrong, when `source=hopbox`. |
+| `job` | The background job id, for `run --bg` and `wait`. |
 
-With `--json`, hopbox prints one JSON object with the same fields instead. `dur` is a number of seconds, and `log` and `error` are `null` when absent:
+With `--json`, hopbox prints one JSON object with the same fields instead. `dur` is a number of seconds, and `log`, `error`, and `job` are `null` when absent:
 
 ```json
-{"dur":42.1,"error":null,"exit":1,"host":"hermes","log":null,"oom":false,"source":"remote"}
+{"dur":42.1,"error":null,"exit":1,"host":"hermes","job":null,"log":null,"oom":false,"source":"remote"}
 ```
 
 Always check `source`. A remote command can exit with any code, including the ones hopbox uses below.

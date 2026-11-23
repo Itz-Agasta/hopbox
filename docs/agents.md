@@ -19,6 +19,18 @@ hopbox run --tail 60 -- cargo nextest run
 
 `--tail 60` keeps the agent's context small: it sees the last 60 lines, and the status line gives the path of the full log, which it can search for the first failure.
 
+## Long jobs in the background
+
+For a job that takes minutes, the agent can start it in the background and keep working:
+
+```sh
+id=$(hopbox run --bg -- cargo build --release)
+# … other work …
+hopbox wait "$id"
+```
+
+`hopbox wait` exits with the job's code and prints the same status line as a foreground run. `hopbox logs "$id"` shows the output so far.
+
 ## How the agent reads the result
 
 The last line of stderr is the status line:
