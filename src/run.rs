@@ -16,8 +16,8 @@ use crate::config::{self, Resolved, RunFlags};
 use crate::exit;
 use crate::quote::shell_quote;
 use crate::remote_script::{
-    Caps, LOCKED_LINE, LockScript, RemotePath, RunScript, UnitName, env_remove_script,
-    env_write_script, oom_check_script, stop_script,
+    BG_STARTED_LINE, Caps, LOCKED_LINE, LockScript, RemotePath, RunScript, UnitName,
+    bg_wrapper_script, env_remove_script, env_write_script, oom_check_script, stop_script,
 };
 use crate::status::{Source, Status};
 use crate::sync::{SyncError, relative_path, sync};
@@ -39,6 +39,8 @@ pub struct Env {
     pub stdout_tty: bool,
     pub lock_wait_secs: u64,
     pub log_dir: PathBuf,
+    /// `$XDG_STATE_HOME/hopbox`: holds the background job index.
+    pub state_dir: PathBuf,
 }
 
 pub fn execute(args: &RunArgs, env: &Env) -> Status {
@@ -77,6 +79,14 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     let r = config::resolve(&global, &repo, &flags).map_err(usage)?;
     *host = r.host_name.clone();
     let cmd = command_for(args, &r)?;
+    if args.bg && (!args.fetch.is_empty() || args.tail.is_some()) {
+        return Err(usage("--bg cannot be combined with --fetch or --tail"));
+    }
+    if args.bg && !r.fetch.is_empty() {
+        eprintln!(
+            "hopbox: warning: fetch paths from .hopbox.toml are not copied back for --bg jobs"
+        );
+    }
     let fetch = r
         .fetch
         .iter()
@@ -106,9 +116,40 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         cpu_weight: r.cpu_weight,
     });
     let interrupt = install_interrupt(&t, caps.as_ref().map(|c| c.unit.clone()));
+    let env_name = (!env_file_body.is_empty()).then(|| format!(".hopbox-env-{}", unit.id()));
+    let script = RunScript {
+        workspace: &ws,
+        subdir: &tree.subdir,
+        caps: caps.as_ref(),
+        shell: &r.shell,
+        cmd: &cmd,
+        env_file: env_name.as_deref(),
+    }
+    .render();
+    let bg_script = args.bg.then(|| {
+        let job_dir = RemotePath::parse(&r.workspace_root)
+            .join("jobs")
+            .join(unit.id());
+        let meta = [
+            format!("ws={ws_name}"),
+            format!("cmd={}", cmd.replace(['\n', '\r'], " ")),
+        ];
+        bg_wrapper_script(&job_dir, &script, caps.as_ref().map(|c| &c.unit), &meta)
+    });
 
     // One lock for sync, job and fetch, so a second run can't change files under this one.
-    let holder = acquire_lock(&t, &ws, &locks, &ws_name, env.lock_wait_secs, &interrupt)?;
+    // A background job inherits it and holds it until the job ends.
+    let holder = acquire_lock(
+        &t,
+        &LockScript {
+            workspace: &ws,
+            locks: &locks,
+            name: &ws_name,
+            wait_secs: env.lock_wait_secs,
+            bg: bg_script.as_deref(),
+        },
+        &interrupt,
+    )?;
 
     if !args.no_sync {
         let synced = sync(&t, &tree, &ws, &r, &|pid| track_pid(pid, &interrupt));
@@ -130,10 +171,7 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         Some(_) => Some(open_log(&env.log_dir, &unit)?),
         None => None,
     };
-    let env_file = format!(".hopbox-env-{}", unit.id());
-    let env_file = if env_file_body.is_empty() {
-        None
-    } else {
+    let env_file = if let Some(env_file) = env_name {
         let out = t.capture_input(
             &env_write_script(&ws, &env_file),
             env_file_body.as_bytes(),
@@ -153,19 +191,38 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
             )));
         }
         Some(env_file)
+    } else {
+        None
     };
     if caps.is_none() {
         eprintln!("hopbox: warning: no resource caps on {}", r.host_name);
     }
-    let script = RunScript {
-        workspace: &ws,
-        subdir: &tree.subdir,
-        caps: caps.as_ref(),
-        shell: &r.shell,
-        cmd: &cmd,
-        env_file: env_file.as_deref(),
+    if args.bg {
+        if let Err(e) = holder.launch() {
+            if let Some(f) = &env_file {
+                let _ = t.capture(&env_remove_script(&ws, f));
+            }
+            return Err(usage(format!(
+                "cannot start the job on {}: {e}",
+                r.host_name
+            )));
+        }
+        let id = unit.id().to_owned();
+        if let Err(e) = crate::jobs::record(&env.state_dir.join("jobs.tsv"), &id, &r.host_name) {
+            eprintln!("hopbox: warning: cannot record job {id} locally: {e}");
+        }
+        println!("{id}");
+        return Ok(Status {
+            exit: 0,
+            source: Source::Hopbox,
+            host: r.host_name.clone(),
+            dur: start.elapsed(),
+            log: None,
+            oom: false,
+            error: None,
+            job: Some(id),
+        });
     }
-    .render();
 
     let mut child = match t.spawn(&script, env.stdout_tty) {
         Ok(c) => c,
@@ -226,6 +283,7 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         log: log.as_ref().map(|l| l.path.clone()),
         oom: false,
         error: write_errors.first().map(|e| format!("log incomplete: {e}")),
+        job: None,
     };
     if let (Some(n), Some(l)) = (args.tail, &log) {
         match tail_lines(&l.path, n) {
@@ -257,9 +315,25 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
 /// The lock-holder ssh session. Closing its stdin releases the lock.
 struct LockHolder {
     child: Child,
+    stdout: BufReader<std::process::ChildStdout>,
 }
 
 impl LockHolder {
+    /// Tell a background lock holder to start its job, and wait for it to confirm.
+    fn launch(mut self) -> Result<(), String> {
+        let mut stdin = self.child.stdin.take().ok_or("lock holder has no stdin")?;
+        stdin.write_all(b"go\n").map_err(|e| e.to_string())?;
+        drop(stdin);
+        let mut line = String::new();
+        let _ = self.stdout.read_line(&mut line);
+        let _ = self.child.wait();
+        if line.trim_end() == BG_STARTED_LINE {
+            Ok(())
+        } else {
+            Err("the remote did not confirm the start".to_owned())
+        }
+    }
+
     fn release(mut self) {
         drop(self.child.stdin.take());
         let _ = self.child.wait();
@@ -276,27 +350,17 @@ impl Drop for LockHolder {
 /// Start the lock holder and wait until it reports `locked` (or fails).
 fn acquire_lock(
     t: &Transport,
-    ws: &RemotePath,
-    locks: &RemotePath,
-    name: &str,
-    wait_secs: u64,
+    lock: &LockScript,
     interrupt: &AtomicBool,
 ) -> Result<LockHolder, Failure> {
-    let script = LockScript {
-        workspace: ws,
-        locks,
-        name,
-        wait_secs,
-    }
-    .render();
-    let mut child = t.spawn_holder(&script).map_err(usage)?;
+    let mut child = t.spawn_holder(&lock.render()).map_err(usage)?;
     track_child(&child, interrupt);
     let mut line = String::new();
-    let stdout = child.stdout.take().expect("piped");
-    let _ = BufReader::new(stdout).read_line(&mut line);
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped"));
+    let _ = stdout.read_line(&mut line);
     CHILD_PID.store(0, Ordering::SeqCst);
     if line.trim_end() == LOCKED_LINE {
-        return Ok(LockHolder { child });
+        return Ok(LockHolder { child, stdout });
     }
     let status = child.wait().map_err(|e| usage(format!("lock: {e}")))?;
     if interrupt.load(Ordering::SeqCst) {

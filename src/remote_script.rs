@@ -135,6 +135,9 @@ pub struct LockScript<'a> {
     pub locks: &'a RemotePath,
     pub name: &'a str,
     pub wait_secs: u64,
+    /// For `run --bg`: once stdin sends `go`, start this script detached (it inherits the
+    /// lock fd, so the lock stays held until the job ends) and print `started`.
+    pub bg: Option<&'a str>,
 }
 
 impl LockScript<'_> {
@@ -144,7 +147,7 @@ impl LockScript<'_> {
              {{ flock -n 9 || {{ echo {wait} >&2; flock -w {secs} 9 || \
              {{ echo {timeout} >&2; exit 124; }}; }}; }} && \
              mkdir -p {ws} && cd {ws} && touch .hopbox-last-used && \
-             echo {locked} && exec cat >/dev/null",
+             echo {locked} && {tail}",
             locks = self.locks.render(),
             lock = self.locks.join(&format!("{}.lock", self.name)).render(),
             ws = self.workspace.render(),
@@ -152,8 +155,49 @@ impl LockScript<'_> {
             secs = self.wait_secs,
             timeout = shell_quote(LOCK_TIMEOUT_LINE),
             locked = LOCKED_LINE,
+            tail = match self.bg {
+                None => "exec cat >/dev/null".to_owned(),
+                Some(script) => format!(
+                    "IFS= read -r go && [ \"$go\" = go ] && \
+                     {{ setsid nohup sh -c {} </dev/null >/dev/null 2>&1 & echo {BG_STARTED_LINE}; }}",
+                    shell_quote(script)
+                ),
+            },
         )
     }
+}
+
+/// Printed by [`LockScript`] after it starts a background job.
+pub const BG_STARTED_LINE: &str = "started";
+
+/// The detached wrapper of a background job, run from `<job_dir>`: records `pid` (also the
+/// process group, thanks to `setsid`) and `meta`, runs `run` with the lock fd closed and its
+/// output in `log`, then writes `exit` atomically (137 plus an `oom` file when the memory
+/// cap killed it).
+pub fn bg_wrapper_script(
+    job_dir: &RemotePath,
+    run: &str,
+    unit: Option<&UnitName>,
+    meta: &[String],
+) -> String {
+    let meta: Vec<String> = meta.iter().map(|m| shell_quote(m).into_owned()).collect();
+    let mut s = format!(
+        "mkdir -p {jd} && cd {jd} && echo $$ > pid && \
+         {{ printf '%s\\n' {meta}; echo \"start=$(date +%s)\"; }} > meta && \
+         {{ ( {run} ) 9>&- >log 2>&1; rc=$?; ",
+        jd = job_dir.render(),
+        meta = meta.join(" "),
+    );
+    if let Some(u) = unit {
+        let scope = shell_quote(&u.scope()).into_owned();
+        s += &format!(
+            "r=$(systemctl --user show -p Result --value {scope} 2>/dev/null); \
+             systemctl --user reset-failed {scope} 2>/dev/null; \
+             if [ \"$r\" = oom-kill ]; then rc=137; touch oom; fi; "
+        );
+    }
+    s += "echo $rc > exit.tmp && mv exit.tmp exit; }";
+    s
 }
 
 /// The script that runs the user's command in the workspace (the lock is held separately).
@@ -762,7 +806,8 @@ mod tests {
                 workspace: &ws,
                 locks: &RemotePath::parse("/l"),
                 name: "my repo-1",
-                wait_secs: 30
+                wait_secs: 30,
+                bg: None,
             }
             .render(),
             concat!(
@@ -784,6 +829,65 @@ mod tests {
             root.join("locks"),
             dir.join("locks/w.lock"),
         )
+    }
+
+    #[test]
+    fn lock_script_bg_tail() {
+        let ws = RemotePath::parse("/w");
+        let s = LockScript {
+            workspace: &ws,
+            locks: &RemotePath::parse("/l"),
+            name: "n",
+            wait_secs: 1,
+            bg: Some("echo 'job'"),
+        }
+        .render();
+        assert!(
+            s.ends_with(concat!(
+                r#"echo locked && IFS= read -r go && [ "$go" = go ] && "#,
+                r#"{ setsid nohup sh -c 'echo '\''job'\''' </dev/null >/dev/null 2>&1 & echo started; }"#
+            )),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn bg_wrapper_golden() {
+        let jd = RemotePath::parse("/r/jobs/0a1b2c3d");
+        let unit = UnitName::random();
+        let scope = unit.scope();
+        let meta = ["ws=w-1".to_owned(), "cmd=echo hi".to_owned()];
+        assert_eq!(
+            bg_wrapper_script(&jd, "exec x", None, &meta),
+            concat!(
+                "mkdir -p /r/jobs/0a1b2c3d && cd /r/jobs/0a1b2c3d && echo $$ > pid && ",
+                r#"{ printf '%s\n' ws=w-1 'cmd=echo hi'; echo "start=$(date +%s)"; } > meta && "#,
+                "{ ( exec x ) 9>&- >log 2>&1; rc=$?; echo $rc > exit.tmp && mv exit.tmp exit; }",
+            )
+        );
+        let capped = bg_wrapper_script(&jd, "exec x", Some(&unit), &meta);
+        assert!(capped.contains(&format!(
+            "r=$(systemctl --user show -p Result --value {scope} 2>/dev/null); "
+        )));
+        assert!(capped.contains(r#"if [ "$r" = oom-kill ]; then rc=137; touch oom; fi; "#));
+    }
+
+    #[test]
+    fn bg_wrapper_runs_in_real_sh() {
+        let dir = tempfile::tempdir().unwrap();
+        let jd = RemotePath::Abs(dir.path().join("j").to_str().unwrap().to_owned());
+        let out = run_local(&bg_wrapper_script(
+            &jd,
+            "echo out; echo err >&2; exit 5",
+            None,
+            &["cmd=x".to_owned()],
+        ));
+        assert!(out.status.success());
+        let read = |f: &str| std::fs::read_to_string(dir.path().join("j").join(f)).unwrap();
+        assert_eq!(read("exit"), "5\n");
+        assert_eq!(read("log"), "out\nerr\n");
+        assert!(read("meta").starts_with("cmd=x\nstart="));
+        assert!(read("pid").trim().parse::<u32>().is_ok());
     }
 
     fn hold_lock(lock: &Path) -> KillOnDrop {
@@ -829,6 +933,7 @@ mod tests {
                     locks: &locks,
                     name: "w",
                     wait_secs: 0,
+                    bg: None,
                 }
                 .render(),
             ))
@@ -861,6 +966,7 @@ mod tests {
                     locks: &locks,
                     name: "w",
                     wait_secs: 5,
+                    bg: None,
                 }
                 .render(),
             ))

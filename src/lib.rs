@@ -5,6 +5,7 @@ pub mod config;
 pub mod doctor;
 pub mod exit;
 pub mod gc;
+pub mod jobs;
 pub mod quote;
 pub mod remote_script;
 pub mod run;
