@@ -28,8 +28,6 @@ pub enum TransportError {
     Unreachable { dest: String, stderr: String },
     #[error("preflight on {dest} failed: {stderr}")]
     Preflight { dest: String, stderr: String },
-    #[error("cannot forward port {local}: {stderr}")]
-    Forward { local: u16, stderr: String },
 }
 
 /// A `--port` forward: local `127.0.0.1:<local>` to the remote's `localhost:<remote>`.
@@ -195,31 +193,21 @@ impl Transport {
         rsh
     }
 
-    /// Add a local forward to the running ControlMaster (`ssh -O forward`).
-    pub fn forward(&self, p: PortSpec) -> Result<(), TransportError> {
-        let out = self.control("forward", p)?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(TransportError::Forward {
-                local: p.local,
-                stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-            })
-        }
-    }
-
-    /// Remove a forward added by [`Transport::forward`]. Best effort.
-    pub fn cancel(&self, p: PortSpec) {
-        let _ = self.control("cancel", p);
-    }
-
-    fn control(&self, op: &str, p: PortSpec) -> Result<Output, TransportError> {
+    /// Start a dedicated, non-multiplexed `ssh -N -L` for one forward. The forward belongs to
+    /// this process alone: killing it removes exactly this forward, never another run's or
+    /// one from `~/.ssh/config` on the shared ControlMaster.
+    pub fn spawn_forward(&self, p: PortSpec) -> Result<Child, TransportError> {
         Ok(Command::new("ssh")
+            // ssh keeps the first value of an option, so these override the base args.
+            .args(["-o", "ControlMaster=no", "-o", "ControlPath=none"])
+            .args(["-o", "ExitOnForwardFailure=yes"])
             .args(self.base_args())
-            .args(["-O", op, "-L", &p.arg(), "--"])
+            .args(["-N", "-L", &p.arg(), "--"])
             .arg(&self.dest)
             .stdin(Stdio::null())
-            .output()?)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?)
     }
 
     /// Open the connection, create the workspace, and probe for resource caps.

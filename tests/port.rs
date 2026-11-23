@@ -87,3 +87,58 @@ fn port_rejects_bad_specs_and_bg() {
         assert_eq!(o.status.code(), Some(125), "{args:?}");
     }
 }
+
+fn pong(port: u16, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if let Ok(mut c) = TcpStream::connect(("127.0.0.1", port)) {
+            let mut got = String::new();
+            let _ = c.set_read_timeout(Some(Duration::from_secs(1)));
+            let _ = c.read_to_string(&mut got);
+            if got == "pong\n" {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+#[test]
+fn same_port_second_run_125_and_first_keeps_its_forward() {
+    let Some(s) = common::sshd() else { return };
+    let (r1, r2) = (repo(&s), repo(&s));
+    let local = free_port();
+    let spec = format!("{local}:9124");
+    let mut first = hopbox(
+        &s,
+        &r1,
+        &[
+            "run",
+            "--port",
+            &spec,
+            "--",
+            "socat TCP-LISTEN:9124,reuseaddr,fork SYSTEM:'echo pong' & sleep 6; kill $!",
+        ],
+    )
+    .spawn()
+    .unwrap();
+    assert!(
+        pong(local, Duration::from_secs(5)),
+        "first forward never came up"
+    );
+    let o = hopbox(&s, &r2, &["run", "--port", &spec, "--", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(125),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        pong(local, Duration::from_secs(1)),
+        "second run broke the first forward"
+    );
+    assert_eq!(first.wait().unwrap().code(), Some(0));
+}

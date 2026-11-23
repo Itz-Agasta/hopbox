@@ -165,7 +165,7 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
         &interrupt,
     )?;
 
-    // Forwards live only for this run; the guard cancels them on every return path.
+    // Forwards live only for this run; the guard stops them on every return path.
     let _forwards = Forwards::open(&t, &ports)?;
 
     if !args.no_sync {
@@ -332,31 +332,58 @@ fn run(args: &RunArgs, env: &Env, start: Instant, host: &mut String) -> Result<S
     Ok(result)
 }
 
-/// `--port` forwards on the ControlMaster, cancelled when dropped.
-struct Forwards<'a> {
-    t: &'a Transport,
-    open: Vec<PortSpec>,
+/// `--port` forwards, one owned ssh process each, stopped when dropped.
+struct Forwards {
+    procs: Vec<Child>,
 }
 
-impl<'a> Forwards<'a> {
-    fn open(t: &'a Transport, ports: &[PortSpec]) -> Result<Forwards<'a>, Failure> {
-        let mut f = Forwards {
-            t,
-            open: Vec::new(),
-        };
+/// How long a new forward has to start accepting connections.
+const FORWARD_READY: Duration = Duration::from_secs(15);
+
+impl Forwards {
+    fn open(t: &Transport, ports: &[PortSpec]) -> Result<Forwards, Failure> {
+        let mut f = Forwards { procs: Vec::new() };
         for &p in ports {
-            // On error `f` drops here and cancels the forwards already open.
-            t.forward(p).map_err(usage)?;
-            f.open.push(p);
+            // A busy port (another run's forward or any other listener) is never shared.
+            // On error `f` drops here and stops the forwards already open.
+            drop(
+                std::net::TcpListener::bind(("127.0.0.1", p.local))
+                    .map_err(|e| usage(format!("cannot forward port {}: {e}", p.local)))?,
+            );
+            let mut child = t.spawn_forward(p).map_err(usage)?;
+            let ready = wait_listening(&mut child, p.local);
+            f.procs.push(child);
+            if !ready {
+                return Err(usage(format!(
+                    "cannot forward port {}: ssh did not start listening",
+                    p.local
+                )));
+            }
         }
         Ok(f)
     }
 }
 
-impl Drop for Forwards<'_> {
+/// Wait until something accepts on `127.0.0.1:<port>` while `child` is still running.
+fn wait_listening(child: &mut Child, port: u16) -> bool {
+    let deadline = Instant::now() + FORWARD_READY;
+    while Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return false;
+        }
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+impl Drop for Forwards {
     fn drop(&mut self) {
-        for &p in &self.open {
-            self.t.cancel(p);
+        for c in &mut self.procs {
+            let _ = c.kill();
+            let _ = c.wait();
         }
     }
 }
