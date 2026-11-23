@@ -30,6 +30,45 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// List background jobs on a host.
+    Jobs {
+        /// Host from the global config (default: `default_host`).
+        #[arg(long, value_name = "NAME")]
+        host: Option<String>,
+        /// Print a JSON array instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a background job's output.
+    Logs {
+        /// Job id printed by `hopbox run --bg`.
+        id: String,
+        /// Keep printing until the job ends.
+        #[arg(short, long)]
+        follow: bool,
+        /// Host (default: the job's host, else `default_host`).
+        #[arg(long, value_name = "NAME")]
+        host: Option<String>,
+    },
+    /// Wait for a background job and exit with its exit code.
+    Wait {
+        /// Job id printed by `hopbox run --bg`.
+        id: String,
+        /// Host (default: the job's host, else `default_host`).
+        #[arg(long, value_name = "NAME")]
+        host: Option<String>,
+        /// Print the final status as one JSON object instead of a text line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop a background job and everything it started.
+    Kill {
+        /// Job id printed by `hopbox run --bg`.
+        id: String,
+        /// Host (default: the job's host, else `default_host`).
+        #[arg(long, value_name = "NAME")]
+        host: Option<String>,
+    },
 }
 
 #[derive(Debug, Default, Args)]

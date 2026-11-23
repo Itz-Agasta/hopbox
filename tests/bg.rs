@@ -1,88 +1,8 @@
 mod common;
 
-use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use assert_cmd::cargo::CommandCargoExt;
-
-struct Repo {
-    _tmp: tempfile::TempDir,
-    root: PathBuf,
-    cfg: PathBuf,
-    state: PathBuf,
-    runtime: PathBuf,
-}
-
-fn repo(s: &common::Sshd) -> Repo {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join("repo");
-    std::fs::create_dir_all(&root).unwrap();
-    assert!(
-        Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(["init", "-q"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    let cfg = tmp.path().join("cfg");
-    std::fs::create_dir_all(cfg.join("hopbox")).unwrap();
-    std::fs::write(
-        cfg.join("hopbox/config.toml"),
-        format!(
-            "default_host = \"test\"\n[hosts.test]\nssh = \"{}\"\n",
-            s.host
-        ),
-    )
-    .unwrap();
-    Repo {
-        root,
-        state: tmp.path().join("state"),
-        runtime: tmp.path().join("run"),
-        cfg,
-        _tmp: tmp,
-    }
-}
-
-fn hopbox(s: &common::Sshd, r: &Repo, args: &[&str]) -> Command {
-    let mut c = Command::cargo_bin("hopbox").unwrap();
-    c.current_dir(&r.root)
-        .args(args)
-        .env("XDG_CONFIG_HOME", &r.cfg)
-        .env("XDG_STATE_HOME", &r.state)
-        .env("XDG_RUNTIME_DIR", &r.runtime)
-        .env("HOPBOX_SSH_CONFIG", &s.ssh_config)
-        .stdin(Stdio::null());
-    c
-}
-
-fn job_id(o: &Output) -> String {
-    let id = String::from_utf8_lossy(&o.stdout).trim().to_owned();
-    assert!(
-        id.len() == 8 && id.bytes().all(|b| b.is_ascii_hexdigit()),
-        "stdout {id:?}, stderr {}",
-        String::from_utf8_lossy(&o.stderr)
-    );
-    id
-}
-
-/// Wait for the job's exit file and return (exit, log).
-fn finished(s: &common::Sshd, id: &str) -> (String, String) {
-    for _ in 0..100 {
-        let o = s.ssh(&format!(
-            "cd ~/.cache/hopbox/jobs/{id} && cat exit && echo --- && cat log"
-        ));
-        if o.status.success() {
-            let text = String::from_utf8(o.stdout).unwrap();
-            let (code, log) = text.split_once("---\n").unwrap();
-            return (code.trim().to_owned(), log.to_owned());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("job {id} never finished");
-}
+use common::{finished, hopbox, job_id, repo};
 
 #[test]
 fn run_bg_prints_id_and_outlives_the_run() {

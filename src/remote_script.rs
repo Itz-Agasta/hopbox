@@ -375,6 +375,85 @@ pub fn gc_delete_script(root: &RemotePath, names: &[String], cutoff: u64) -> Str
     )
 }
 
+/// Exit code of the job scripts below when `<root>/jobs/<id>` does not exist.
+pub const NO_JOB_EXIT: i32 = 66;
+
+fn job_dir_cd(root: &RemotePath, id: &str) -> String {
+    format!(
+        "cd {} 2>/dev/null || exit {NO_JOB_EXIT}; ",
+        root.join("jobs").join(id).render()
+    )
+}
+
+/// One line `now=<epoch>`, then per job `<id>\t<state>\t<exit or ->\t<start>\t<cmd>`, where
+/// state is `done` (exit file), `running` (pid alive) or `lost`.
+pub fn jobs_list_script(root: &RemotePath) -> String {
+    format!(
+        concat!(
+            r#"echo "now=$(date +%s)"; cd {jobs} 2>/dev/null || exit 0; "#,
+            r#"for d in */; do id=${{d%/}}; [ -f "$id/meta" ] || continue; "#,
+            r#"if [ -f "$id/exit" ]; then st=done; ex=$(cat "$id/exit"); "#,
+            r#"elif kill -0 "$(cat "$id/pid" 2>/dev/null)" 2>/dev/null; then st=running; ex=-; "#,
+            r#"else st=lost; ex=-; fi; "#,
+            r#"printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$st" "$ex" "$(sed -n 's/^start=//p' "$id/meta")" "#,
+            r#""$(sed -n 's/^cmd=//p' "$id/meta")"; done"#,
+        ),
+        jobs = root.join("jobs").render()
+    )
+}
+
+/// Print the job's log; with `follow`, keep printing until the job ends.
+pub fn job_logs_script(root: &RemotePath, id: &str, follow: bool) -> String {
+    let mut s = job_dir_cd(root, id);
+    if follow {
+        s += r#"if [ -f exit ]; then cat log; else tail -n +1 -f --pid="$(cat pid)" log; fi"#;
+    } else {
+        s += "cat log";
+    }
+    s
+}
+
+/// Wait for the job to end. Prints its exit code (plus a line `oom` when the memory cap
+/// killed it), or `lost` when the wrapper died without writing one.
+pub fn job_wait_script(root: &RemotePath, id: &str) -> String {
+    job_dir_cd(root, id)
+        + concat!(
+            r#"pid=$(cat pid); while [ ! -e exit ]; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done; "#,
+            r#"if [ -e exit ]; then cat exit; if [ -e oom ]; then echo oom; fi; else echo lost; fi"#,
+        )
+}
+
+/// Stop the job: its scope when capped, and its whole process group (no `--`: dash's kill
+/// rejects it). Prints `done` when the
+/// job had already finished.
+pub fn job_kill_script(root: &RemotePath, id: &str) -> String {
+    let scope = shell_quote(&format!("hopbox-{id}.scope")).into_owned();
+    job_dir_cd(root, id)
+        + &format!(
+            concat!(
+                r#"if [ -e exit ]; then echo done; exit 0; fi; "#,
+                r#"systemctl --user stop {scope} 2>/dev/null; "#,
+                r#"kill -TERM -"$(cat pid)" 2>/dev/null; true"#,
+            ),
+            scope = scope
+        )
+}
+
+/// Remove finished job dirs whose exit file is older than `cutoff` (remote epoch seconds).
+/// Prints `job <id>` per match; deletes only when `delete` is true.
+pub fn gc_jobs_script(root: &RemotePath, cutoff: u64, delete: bool) -> String {
+    format!(
+        concat!(
+            r#"cd {jobs} 2>/dev/null || exit 0; for d in */; do id=${{d%/}}; "#,
+            r#"[ -f "$id/exit" ] || continue; t=$(stat -c %Y -- "$id/exit") || continue; "#,
+            r#"[ "$t" -le {cutoff} ] || continue; {rm}echo "job $id"; done"#,
+        ),
+        jobs = root.join("jobs").render(),
+        cutoff = cutoff,
+        rm = if delete { r#"rm -rf -- "$id" && "# } else { "" },
+    )
+}
+
 /// Wrap a script as one `sh -c` command line for ssh.
 pub fn wrap_for_ssh(script: &str) -> String {
     format!("sh -c {}", shell_quote(script))

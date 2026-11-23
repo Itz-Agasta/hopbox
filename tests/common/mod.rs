@@ -157,3 +157,84 @@ impl Sshd {
             .expect("spawn ssh")
     }
 }
+
+// Helpers for tests that drive the hopbox binary against the container.
+
+/// A git repo with a hopbox config pointing at the test sshd.
+pub struct Repo {
+    _tmp: tempfile::TempDir,
+    pub root: PathBuf,
+    pub cfg: PathBuf,
+    pub state: PathBuf,
+    pub runtime: PathBuf,
+}
+
+pub fn repo(s: &Sshd) -> Repo {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let cfg = tmp.path().join("cfg");
+    std::fs::create_dir_all(cfg.join("hopbox")).unwrap();
+    std::fs::write(
+        cfg.join("hopbox/config.toml"),
+        format!(
+            "default_host = \"test\"\n[hosts.test]\nssh = \"{}\"\n",
+            s.host
+        ),
+    )
+    .unwrap();
+    Repo {
+        root,
+        state: tmp.path().join("state"),
+        runtime: tmp.path().join("run"),
+        cfg,
+        _tmp: tmp,
+    }
+}
+
+pub fn hopbox(s: &Sshd, r: &Repo, args: &[&str]) -> Command {
+    let mut c = <Command as assert_cmd::cargo::CommandCargoExt>::cargo_bin("hopbox").unwrap();
+    c.current_dir(&r.root)
+        .args(args)
+        .env("XDG_CONFIG_HOME", &r.cfg)
+        .env("XDG_STATE_HOME", &r.state)
+        .env("XDG_RUNTIME_DIR", &r.runtime)
+        .env("HOPBOX_SSH_CONFIG", &s.ssh_config)
+        .stdin(Stdio::null());
+    c
+}
+
+pub fn job_id(o: &Output) -> String {
+    let id = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+    assert!(
+        id.len() == 8 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+        "stdout {id:?}, stderr {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    id
+}
+
+/// Wait for the job's exit file and return (exit, log).
+pub fn finished(s: &Sshd, id: &str) -> (String, String) {
+    for _ in 0..100 {
+        let o = s.ssh(&format!(
+            "cd ~/.cache/hopbox/jobs/{id} && cat exit && echo --- && cat log"
+        ));
+        if o.status.success() {
+            let text = String::from_utf8(o.stdout).unwrap();
+            let (code, log) = text.split_once("---\n").unwrap();
+            return (code.trim().to_owned(), log.to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("job {id} never finished");
+}

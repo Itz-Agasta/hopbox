@@ -137,6 +137,11 @@ impl Transport {
         Ok(child.wait_with_output()?)
     }
 
+    /// Run a script with stdout and stderr going straight to ours; stdin is closed.
+    pub fn stream(&self, script: &str) -> Result<std::process::ExitStatus, TransportError> {
+        Ok(self.command(script, false).stdin(Stdio::null()).status()?)
+    }
+
     /// Start a script with stdout and stderr piped and stdin inherited.
     pub fn spawn(&self, script: &str, tty: bool) -> Result<Child, TransportError> {
         Ok(self
