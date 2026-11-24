@@ -139,6 +139,8 @@ impl Transport {
             control_path,
             "ControlPersist=5m".into(),
             "BatchMode=yes".into(),
+            // Hides "Shared connection to <ip> closed." after tty runs; real errors still print.
+            "LogLevel=ERROR".into(),
             "ConnectTimeout=10".into(),
         ] {
             args.push("-o".into());
@@ -363,6 +365,8 @@ mod tests {
             "ControlPersist=5m",
             "-o",
             "BatchMode=yes",
+            "-o",
+            "LogLevel=ERROR",
             "-o",
             "ConnectTimeout=10",
         ];
