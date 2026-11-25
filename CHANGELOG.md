@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.1
+
+### Fixes
+
+- A run that uses a terminal no longer ends with ssh's "Shared connection closed" line after the status line.
+
+### Docs
+
+- The README and the agents page now show how to add a hopbox rule to the global instructions of Claude Code, Codex, and OpenCode, and a Claude Code `SessionStart` hook.
+
 ## 1.0.0
 
 hopbox 1.0 runs your heavy builds and tests on another machine over SSH and gives you the result as if they ran locally. It's built for coding agents and for the developer typing the same commands.
