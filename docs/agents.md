@@ -17,7 +17,52 @@ claude plugin marketplace add Itz-Agasta/hopbox
 claude plugin install hopbox@hopbox
 ```
 
+To install it for specific agents, pass `-a`:
+
+```sh
+npx skills add Itz-Agasta/hopbox --skill hopbox -g -a codex -a opencode
+```
+
 To install it by hand, copy `skills/hopbox` into your agent's skills directory, such as `~/.claude/skills/`.
+
+## Make the agent offload on its own
+
+A skill loads when the agent decides it applies. To nudge that decision, add one line to your agent's global instructions file, so it applies in every repo:
+
+```md
+For full test suites, release builds and e2e runs, use hopbox (default host hermes) via the `hopbox` skill.
+```
+
+| Agent | Global file | Notes |
+|---|---|---|
+| Claude Code | `~/.claude/CLAUDE.md` | |
+| Codex | `~/.codex/AGENTS.md` | Codex reads `~/.codex/AGENTS.override.md` instead when it exists. |
+| OpenCode | `~/.config/opencode/AGENTS.md` | Without this file, OpenCode falls back to `~/.claude/CLAUDE.md`. |
+
+Replace `hermes` with the name of your default host. Keep the line short: the skill holds the details.
+
+### Claude Code hook
+
+If you want a reminder injected at the start of every session instead of a standing rule, add a `SessionStart` hook to `~/.claude/settings.json`. The hook's stdout becomes context for the session:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'For full test suites, release builds and e2e runs, use hopbox via the hopbox skill.'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Merge the `hooks` key into your existing file instead of replacing it.
 
 ## What the agent runs
 

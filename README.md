@@ -42,6 +42,20 @@ npx skills add Itz-Agasta/hopbox --skill hopbox -g     # Claude Code, Codex, Cur
 
 In Claude Code you can also run `/plugin install hopbox --marketplace Itz-Agasta/hopbox`.
 
+The skill tells the agent how to use hopbox once it decides to. To make it decide on its own, add a line to your agent's global instructions file:
+
+```md
+For full test suites, release builds and e2e runs, use hopbox (default host hermes) via the `hopbox` skill.
+```
+
+| Agent | Global instructions file |
+|---|---|
+| Claude Code | `~/.claude/CLAUDE.md` |
+| Codex | `~/.codex/AGENTS.md` |
+| OpenCode | `~/.config/opencode/AGENTS.md` |
+
+Replace `hermes` with the name of your host. [For coding agents](docs/agents.md) covers per-agent install flags, a Claude Code hook, and what the agent sees.
+
 ## Install
 
 With Cargo, from [crates.io](https://crates.io/crates/hopbox):
