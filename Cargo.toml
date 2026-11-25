@@ -11,7 +11,7 @@ keywords = ["ssh", "remote", "build", "agents", "rsync"]
 categories = ["command-line-utilities", "development-tools"]
 homepage = "https://github.com/Itz-Agasta/hopbox"
 documentation = "https://github.com/Itz-Agasta/hopbox/tree/main/docs"
-include = ["src/**", "docs/**", "skills/**", "LICENSE-*", "README.md", "VISION.md"]
+include = ["/src/**", "/docs/**", "/skills/**", "/LICENSE-*", "/README.md", "/VISION.md"]
 
 [dependencies]
 anyhow = "1.0.104"
