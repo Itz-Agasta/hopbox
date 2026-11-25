@@ -35,7 +35,7 @@ For full test suites, release builds and e2e runs, use hopbox (default host herm
 
 | Agent | Global file | Notes |
 |---|---|---|
-| Claude Code | `~/.claude/CLAUDE.md` | |
+| Claude Code | `~/.claude/CLAUDE.md` | Loads in every project. |
 | Codex | `~/.codex/AGENTS.md` | Codex reads `~/.codex/AGENTS.override.md` instead when it exists. |
 | OpenCode | `~/.config/opencode/AGENTS.md` | Without this file, OpenCode falls back to `~/.claude/CLAUDE.md`. |
 

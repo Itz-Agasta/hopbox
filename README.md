@@ -54,7 +54,7 @@ For full test suites, release builds and e2e runs, use hopbox (default host herm
 | Codex | `~/.codex/AGENTS.md` |
 | OpenCode | `~/.config/opencode/AGENTS.md` |
 
-Replace `hermes` with the name of your host. [For coding agents](docs/agents.md) covers per-agent install flags, a Claude Code hook, and what the agent sees.
+Replace `hermes` with the name of your host. See [For coding agents](docs/agents.md) for per-agent install flags and a Claude Code hook.
 
 ## Install
 
